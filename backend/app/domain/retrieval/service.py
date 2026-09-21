@@ -16,7 +16,8 @@ import hashlib
 import json
 import logging
 import uuid
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -26,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.audit.models import AuditEvent
 from app.domain.derived_memory.service import ACTIVE_EMBEDDING_MODEL
+from app.domain.retrieval.diagnostics import MetadataMergeDiagnostic, RetrievalDiagnosticsCollector
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +198,7 @@ def _fusion_key(candidate: dict) -> str:
 def _merge_rrf(
     keyword_candidates: list[dict],
     semantic_candidates: list[dict],
+    diagnostics: RetrievalDiagnosticsCollector | None = None,
 ) -> list[dict]:
     """Fuse two ranked candidate lists with RRF on a stable identity (GPT5.6 #4).
 
@@ -207,25 +210,81 @@ def _merge_rrf(
     priority = {t: i for i, t in enumerate(_PRIORITY_ORDER)}
     scores: dict[str, float] = {}
     representative: dict[str, dict] = {}
+    observations: dict[str, list[tuple[str, int, dict, float]]] = {}
+    reasons: dict[str, str] = {}
 
-    for ranked in (keyword_candidates, semantic_candidates):
+    for channel, ranked in (("lexical", keyword_candidates), ("semantic", semantic_candidates)):
         for rank, candidate in enumerate(ranked, start=1):
             key = _fusion_key(candidate)
-            scores[key] = scores.get(key, 0.0) + rrf_score(rank)
+            contribution = rrf_score(rank)
+            scores[key] = scores.get(key, 0.0) + contribution
+            observations.setdefault(key, []).append((channel, rank, candidate, contribution))
             current = representative.get(key)
             if current is None or priority.get(candidate.get("type"), 99) < priority.get(
                 current.get("type"), 99
             ):
                 representative[key] = candidate
+                reasons[key] = "first_visible_candidate" if current is None else "higher_memory_type_priority"
+
+    if diagnostics:
+        diagnostics.thresholds.update({"rrf_k": RRF_K, "rrf_minimum": RRF_MIN_THRESHOLD, "rrf_final_top_n": RRF_FINAL_TOP_N})
+
+    # Merge provenance into the chosen representative without changing its identity,
+    # score, or ordering. Conflicting scalars retain the representative's value.
+    merged_metadata: dict[str, MetadataMergeDiagnostic] = {}
+    for key, visible in observations.items():
+        chosen = representative[key]
+        ordered = [entry[2] for entry in visible if entry[2] is chosen] + [entry[2] for entry in visible if entry[2] is not chosen]
+        merged = deepcopy(ordered[0].get("provenance") or {})
+        conflicts: list[str] = []
+        merged_paths: list[str] = []
+
+        def merge_dict(target: dict, incoming: dict, prefix: str = "") -> None:
+            for name in sorted(incoming):
+                path = f"{prefix}.{name}" if prefix else name
+                value = deepcopy(incoming[name])
+                if name not in target or target[name] is None:
+                    target[name] = value; merged_paths.append(path)
+                elif isinstance(target[name], dict) and isinstance(value, dict):
+                    merge_dict(target[name], value, path)
+                elif isinstance(target[name], list) and isinstance(value, list):
+                    for item in value:
+                        if item not in target[name]: target[name].append(item)
+                    merged_paths.append(path)
+                elif target[name] != value:
+                    conflicts.append(path)
+
+        for other in ordered[1:]: merge_dict(merged, other.get("provenance") or {})
+        chosen_copy = dict(chosen); chosen_copy["provenance"] = merged
+        representative[key] = chosen_copy
+        unresolved_before = {}
+        for channel, _, cand, _ in visible:
+            values = ((cand.get("provenance") or {}).get("source_metadata") or {}).get("unresolved_questions") or []
+            if values: unresolved_before[channel] = list(values)
+        unresolved_after = (merged.get("source_metadata") or {}).get("unresolved_questions") or []
+        merged_metadata[key] = MetadataMergeDiagnostic(
+            merged_keys=sorted(set(merged_paths)), conflict_paths=sorted(set(conflicts)),
+            unresolved_before=unresolved_before, unresolved_after=list(unresolved_after),
+            conflicts_before={channel: cand.get("conflict_label") for channel, _, cand, _ in visible if cand.get("conflict_label") is not None},
+            conflict_after=chosen_copy.get("conflict_label"),
+        )
+        if diagnostics:
+            diagnostics.record_fusion(key, visible, chosen_copy, scores[key], reasons[key], merged_metadata[key])
 
     fused = [(key, score) for key, score in scores.items() if score >= RRF_MIN_THRESHOLD]
     fused.sort(key=lambda kv: kv[1], reverse=True)
 
     result: list[dict] = []
-    for key, score in fused[:RRF_FINAL_TOP_N]:
+    included = {key for key, _ in fused[:RRF_FINAL_TOP_N]}
+    if diagnostics:
+        for key, score in scores.items():
+            if score < RRF_MIN_THRESHOLD: diagnostics.exclude(representative[key]["id"], "rrf_threshold", "rrf_below_threshold")
+            elif key not in included: diagnostics.exclude(representative[key]["id"], "fusion_limit", "fused_top_n_limit")
+    for final_rank, (key, score) in enumerate(fused[:RRF_FINAL_TOP_N], start=1):
         candidate = dict(representative[key])
         candidate["score"] = score
         result.append(candidate)
+        if diagnostics: diagnostics.mark_rank(candidate["id"], final_rank)
     return result
 
 
@@ -237,6 +296,7 @@ _PRIORITY_ORDER = ["canonical", "fact", "summary", "excerpt"]
 def apply_budget_trimming(
     items: list[RetrievalItem],
     budget: int,
+    diagnostics: RetrievalDiagnosticsCollector | None = None,
 ) -> tuple[list[RetrievalItem], int, Literal["budget_met", "result_exhausted"]]:
     """Apply strict priority budget trimming.
 
@@ -256,6 +316,8 @@ def apply_budget_trimming(
         if used + item_len <= budget:
             result.append(item)
             used += item_len
+        elif diagnostics:
+            diagnostics.exclude(item.id, "priority_budget_trimming", "character_budget_exceeded")
         # If item doesn't fit: skip entirely (never truncate)
         if used >= budget:
             return result, used, "budget_met"
@@ -769,6 +831,7 @@ def _apply_candidate_filters(candidates: list[dict], f: RetrievalFilters) -> lis
 async def retrieve(
     session: AsyncSession,
     req: RetrievalRequest,
+    diagnostics: RetrievalDiagnosticsCollector | None = None,
 ) -> RetrievalResponse:
     """Execute retrieval and return a context-budgeted response.
 
@@ -777,12 +840,18 @@ async def retrieve(
     Uses in-process LRU cache for repeated identical queries.
     """
     req.query = _sanitize_fts_query(req.query)
+    if diagnostics is not None:
+        diagnostics.filters = {
+            key: value for key, value in asdict(req.filters).items()
+            if value not in (None, "", [], ())
+        }
     if req.mode not in ("keyword", "semantic", "hybrid"):
         raise ValueError(
             f"Invalid retrieval mode {req.mode!r}: must be 'keyword', 'semantic', or 'hybrid'"
         )
     cache_key = _cache_key(req)
-    if cache_key in _cache:
+    cache_allowed = diagnostics is None
+    if cache_allowed and cache_key in _cache:
         logger.debug("Retrieval cache hit for query=%r", req.query[:50])
         # NOTE: Audit events are intentionally NOT emitted on cache hits.
         # The original retrieve() call already recorded the audit event.
@@ -797,12 +866,16 @@ async def retrieve(
             session, req.query, RRF_CANDIDATES_PER_MODE,
             tags=req.filters.tags or None, filters=req.filters,
         )
+        if diagnostics is not None and len(candidates) >= RRF_CANDIDATES_PER_MODE:
+            diagnostics.record_unknown_exclusion("lexical_sql_limit", "not_observable_at_this_stage")
 
     elif req.mode == "semantic":
         candidates, degraded = await _semantic_candidates(
             session, req.query, RRF_CANDIDATES_PER_MODE,
             tags=req.filters.tags or None, filters=req.filters,
         )
+        if diagnostics is not None and len(candidates) >= RRF_CANDIDATES_PER_MODE:
+            diagnostics.record_unknown_exclusion("semantic_sql_limit", "not_observable_at_this_stage")
 
     else:  # hybrid
         kw_candidates = await _keyword_candidates(
@@ -814,6 +887,12 @@ async def retrieve(
             tags=req.filters.tags or None, filters=req.filters,
         )
 
+        if diagnostics is not None:
+            if len(kw_candidates) >= RRF_CANDIDATES_PER_MODE:
+                diagnostics.record_unknown_exclusion("lexical_sql_limit", "not_observable_at_this_stage")
+            if len(sem_candidates) >= RRF_CANDIDATES_PER_MODE:
+                diagnostics.record_unknown_exclusion("semantic_sql_limit", "not_observable_at_this_stage")
+
         if sem_degraded or not sem_candidates:
             degraded = True
             effective_mode = "keyword"
@@ -822,7 +901,7 @@ async def retrieve(
             # GPT5.6 #4: fuse on a stable cross-modal identity so the same
             # conversation ranked by both modes combines its votes (was fused on
             # per-mode row ids that can never match across modes).
-            candidates = _merge_rrf(kw_candidates, sem_candidates)
+            candidates = _merge_rrf(kw_candidates, sem_candidates, diagnostics=diagnostics)
 
     # ── Link traversal — fetch linked facts for direct candidates ────────────
     direct_archive_ids = list({c["source_id"] for c in candidates if c.get("source_id")})
@@ -836,7 +915,13 @@ async def retrieve(
         logger.debug("Link traversal failed (non-fatal): %s", exc)
 
     # GPT5.6 #4: enforce declared filters on the final candidate set
+    before_filters = candidates
     candidates = _apply_candidate_filters(candidates, req.filters)
+    if diagnostics is not None:
+        retained_ids = {candidate["id"] for candidate in candidates}
+        for candidate in before_filters:
+            if candidate["id"] not in retained_ids:
+                diagnostics.exclude(candidate["id"], "final_candidate_filter", "declared_filter_mismatch")
 
     items = [
         RetrievalItem(
@@ -855,7 +940,7 @@ async def retrieve(
         for c in candidates
     ]
 
-    trimmed_items, budget_used, trimming_reason = apply_budget_trimming(items, req.budget)
+    trimmed_items, budget_used, trimming_reason = apply_budget_trimming(items, req.budget, diagnostics=diagnostics)
 
     response = RetrievalResponse(
         query=req.query,
@@ -882,5 +967,6 @@ async def retrieve(
     await session.flush()
     # NOTE: Commit is left to the caller (API dependency or MCP session manager).
 
-    _cache[cache_key] = response
+    if cache_allowed:
+        _cache[cache_key] = response
     return response

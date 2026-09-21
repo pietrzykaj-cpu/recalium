@@ -1,0 +1,30 @@
+{
+  "schema_version": "recalium.model-succession-provenance.v1.1",
+  "experiment_id": "recalium-model-succession-experiment-v1.1",
+  "canonical_inputs": {
+    "authoritative_spec": {
+      "path": "backend/experiments/model_succession_v1/authoritative-spec.v1.1.json",
+      "file_sha256": "28f702b9ab6a6186468b85b2c2d8042640aea9bab39d67700fce3c7017cb83e6",
+      "canonical_content_sha256": "e9416f1a660d718355145ad415cf77c0b1efb6f4562321bedc4a87a93ba7a82c"
+    },
+    "frozen_schedule": {
+      "path": "backend/experiments/model_succession_v1/frozen-schedule-v1.1.json",
+      "file_sha256": "d0229aa5a9c1fa6a4c7ebcad61e62e4983526b67905069fb1749d32ca08f83d8",
+      "canonical_content_sha256": "4f4fc8b9f79f36807d5114eb647271a2683b7087f4dfafd82d0191f04d072de3",
+      "declared_spec_canonical_content_sha256": "e9416f1a660d718355145ad415cf77c0b1efb6f4562321bedc4a87a93ba7a82c"
+    },
+    "synthetic_manifest": {
+      "path": "backend/experiments/model_succession_v1/manifest.v1.json",
+      "file_sha256": "7c47fd7ee26d92ad63ac9cc24f6e289fd6cc1120efb5644f19e0efea22394b30"
+    }
+  },
+  "source_protocol": {
+    "version": "v1",
+    "raw_sha256": "1febc13c347e46dfda0aaad2761839b20c1f665de877cf4be75e8f01d7b532ce"
+  },
+  "compatibility_representation": {
+    "path": "backend/experiments/model_succession_v1/spec.v1.1.json",
+    "file_sha256": "fdad26a10faee10a989863553b4f42a0863a2f7f76f669a836a3fccf376ccd5b",
+    "role": "Compatibility representation for the current v11 runtime path; semantically equivalent to authoritative-spec.v1.1.json and not a second authoritative definition."
+  }
+}

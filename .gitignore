@@ -99,6 +99,9 @@ temp/
 *.tmp
 *.bak
 
+# Generated Experiment v1/v1.1 execution outputs; source/specification live above.
+backend/experiments/model_succession_v1/results/
+
 # Tool artifacts
 .superpowers/
 website/.astro/

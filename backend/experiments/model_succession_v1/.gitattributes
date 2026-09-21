@@ -1,0 +1,3 @@
+# Canonical frozen scientific inputs: preserve authoritative bytes in Git blobs.
+authoritative-spec.v1.1.json -text -diff
+frozen-schedule-v1.1.json -text -diff

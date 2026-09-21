@@ -1,0 +1,93 @@
+{
+  "schema_version": "recalium.model-succession-experiment-spec.v1.1",
+  "experiment_id": "recalium-model-succession-experiment-v1.1",
+  "version": "1.1.0",
+  "historical_v1": {
+    "run3_responses_are_reused": false,
+    "note": "Experiment v1 Run 3 is historical, blinded, unscored, and excluded from v1.1."
+  },
+  "source_protocol": {
+    "version": "v1",
+    "raw_sha256": "1febc13c347e46dfda0aaad2761839b20c1f665de877cf4be75e8f01d7b532ce"
+  },
+  "fixture": {
+    "manifest_canonical_sha256": "f74c5e8a908e9523e094cf7da21ce341fee15947d07397bd3b8f4c03411fdf26"
+  },
+  "design": {
+    "task_ids": [
+      "T01",
+      "T02",
+      "T03",
+      "T04",
+      "T05",
+      "T06",
+      "T07",
+      "T08",
+      "T09",
+      "T10",
+      "T11",
+      "T12",
+      "T13",
+      "T14"
+    ],
+    "conditions": [
+      "A",
+      "B",
+      "C"
+    ],
+    "replicates_per_task_condition": 10,
+    "expected_total_responses": 420
+  },
+  "parity": {
+    "b_c_ordered_atom_parity": true,
+    "no_evidence_truncation": true
+  },
+  "randomization": {
+    "method": "python-random-mt19937-global-shuffle-v1",
+    "schedule_seed": 20260915,
+    "decision": "one complete 420-trial schedule is frozen before inference"
+  },
+  "blinding": {
+    "blind_id_scheme": "sha256-v1",
+    "blind_salt_id": "recalium-v1.1-scorer-salt-v1",
+    "condition_mapping_withheld_from_scorer": true
+  },
+  "execution": {
+    "provider": "ollama",
+    "model": "qwen3:4b",
+    "expected_model_digest": "359d7dd4bcdab3d86b87d73ac27966f4dbb9f5efdfcc75d34a8764a09474fae7",
+    "num_ctx": 4096,
+    "think": false,
+    "temperature": 0,
+    "inference_seed_policy": "fixed-identical-per-trial",
+    "inference_seed": 20260915,
+    "num_predict": 512,
+    "http_read_timeout_seconds": 180,
+    "watchdog_seconds": 210,
+    "concurrency": 1,
+    "automatic_retries": false,
+    "checkpoint_policy": "append-only-one-record-per-frozen-trial"
+  },
+  "scoring": {
+    "rubric_version": "experiment-v1-protocol-section-5",
+    "rubric_protocol_sha256": "1febc13c347e46dfda0aaad2761839b20c1f665de877cf4be75e8f01d7b532ce",
+    "analysis_seed_policy": "fixed-required-before-scoring; numeric seed was not specified by v1",
+    "expected_result_schema": "recalium.model-succession-experiment-results.v1.1",
+    "completion_requirement": "420 mapped responses; at least 95 percent successful request completion per condition for T01-T13",
+    "thresholds": {
+      "c_mean_ics_min": 80,
+      "c_minus_b_ics_min": 5,
+      "bootstrap_resamples": 10000,
+      "bootstrap_ci_lower_gt": 0,
+      "c_factual_not_worse_than_b_pp": 2,
+      "c_hallucination_not_more_than_b_pp": 2,
+      "c_severe_identity_leakage_max": 0,
+      "c_mild_identity_leakage_max_percent": 2,
+      "c_t09_exact_verbatim_min_percent": 90
+    }
+  },
+  "output": {
+    "schedule_schema": "recalium.model-succession-schedule.v1.1",
+    "result_schema": "recalium.model-succession-experiment-results.v1.1"
+  }
+}
