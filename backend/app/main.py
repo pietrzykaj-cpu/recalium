@@ -20,6 +20,7 @@ from starlette.responses import JSONResponse as _JSONResponse
 from starlette.responses import FileResponse as _FileResponse
 from starlette.exceptions import HTTPException as _StarletteHTTPException
 
+from app.api.bridge import bridge_app, bridge_mcp
 from app.api.routes import router as api_router
 from app.api.routes.search import router as search_router
 from app.api.routes.canonical import router as canonical_router
@@ -189,7 +190,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("DB pool initialized. Application ready.")
     logger.info("MCP retrieve_memory tool registered (SSE transport on /mcp/sse)")
-    yield
+    async with bridge_mcp.session_manager.run():
+        yield
 
     # Shutdown pipeline worker cleanly
     _worker_task.cancel()
@@ -332,6 +334,8 @@ def create_app() -> FastAPI:
     app.include_router(portability_router, prefix="/api", tags=["portability"])
     app.include_router(tags_router)
     app.include_router(facts_router)
+
+    app.mount("/bridge", bridge_app)
 
     # MCP SSE transport — bound to /mcp prefix.
     # SECURITY: Upstream proxy/uvicorn must bind to 127.0.0.1 only (DNS rebinding prevention).

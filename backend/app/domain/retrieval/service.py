@@ -55,6 +55,9 @@ class RetrievalFilters:
     time_range_end: str | None = None
     canonical_only: bool = False
     tags: list[str] = field(default_factory=list)
+    # Internal authorization scope, never accepted by legacy public filters.
+    bridge_project_id: str | None = None
+    bridge_project_ids: tuple[str, ...] | None = None
 
 
 @dataclass
@@ -88,7 +91,7 @@ class RetrievalResponse:
     retrieval_mode: str
     budget_used: int
     budget_limit: int
-    trimming_reason: Literal["budget_met", "result_exhausted"]
+    trimming_reason: Literal["budget_met", "result_exhausted", "result_limit"]
     items: list[RetrievalItem]
     degraded_mode: bool = False
 
@@ -200,12 +203,28 @@ def _merge_rrf(
     semantic_candidates: list[dict],
     diagnostics: RetrievalDiagnosticsCollector | None = None,
 ) -> list[dict]:
+    """Fuse candidates using the ordinary retrieval cap."""
+    return _merge_rrf_limited(
+        keyword_candidates,
+        semantic_candidates,
+        limit=RRF_FINAL_TOP_N,
+        diagnostics=diagnostics,
+    )
+
+
+def _merge_rrf_limited(
+    keyword_candidates: list[dict],
+    semantic_candidates: list[dict],
+    *,
+    limit: int,
+    diagnostics: RetrievalDiagnosticsCollector | None = None,
+) -> list[dict]:
     """Fuse two ranked candidate lists with RRF on a stable identity (GPT5.6 #4).
 
     Each mode's list is assumed already ranked best-first. Votes are accumulated per
     stable fusion key; the representative shown for a fused unit is its highest-priority
     type (canonical → fact → summary → excerpt). Returns representative candidate dicts
-    with their combined RRF score, sorted desc and capped at ``RRF_FINAL_TOP_N``.
+    with their combined RRF score, sorted desc and capped at ``limit``.
     """
     priority = {t: i for i, t in enumerate(_PRIORITY_ORDER)}
     scores: dict[str, float] = {}
@@ -227,7 +246,7 @@ def _merge_rrf(
                 reasons[key] = "first_visible_candidate" if current is None else "higher_memory_type_priority"
 
     if diagnostics:
-        diagnostics.thresholds.update({"rrf_k": RRF_K, "rrf_minimum": RRF_MIN_THRESHOLD, "rrf_final_top_n": RRF_FINAL_TOP_N})
+        diagnostics.thresholds.update({"rrf_k": RRF_K, "rrf_minimum": RRF_MIN_THRESHOLD, "rrf_final_top_n": limit})
 
     # Merge provenance into the chosen representative without changing its identity,
     # score, or ordering. Conflicting scalars retain the representative's value.
@@ -275,12 +294,12 @@ def _merge_rrf(
     fused.sort(key=lambda kv: kv[1], reverse=True)
 
     result: list[dict] = []
-    included = {key for key, _ in fused[:RRF_FINAL_TOP_N]}
+    included = {key for key, _ in fused[:limit]}
     if diagnostics:
         for key, score in scores.items():
             if score < RRF_MIN_THRESHOLD: diagnostics.exclude(representative[key]["id"], "rrf_threshold", "rrf_below_threshold")
             elif key not in included: diagnostics.exclude(representative[key]["id"], "fusion_limit", "fused_top_n_limit")
-    for final_rank, (key, score) in enumerate(fused[:RRF_FINAL_TOP_N], start=1):
+    for final_rank, (key, score) in enumerate(fused[:limit], start=1):
         candidate = dict(representative[key])
         candidate["score"] = score
         result.append(candidate)
@@ -319,6 +338,37 @@ def apply_budget_trimming(
         elif diagnostics:
             diagnostics.exclude(item.id, "priority_budget_trimming", "character_budget_exceeded")
         # If item doesn't fit: skip entirely (never truncate)
+        if used >= budget:
+            return result, used, "budget_met"
+
+    return result, used, "result_exhausted"
+
+
+def _apply_budget_trimming_for_scoped_retrieval(
+    items: list[RetrievalItem],
+    budget: int,
+    *,
+    limit: int | None,
+    diagnostics: RetrievalDiagnosticsCollector | None = None,
+) -> tuple[list[RetrievalItem], int, Literal["budget_met", "result_exhausted", "result_limit"]]:
+    """Bridge-only result-count extension for scoped retrieval."""
+    priority_map = {t: i for i, t in enumerate(_PRIORITY_ORDER)}
+    sorted_items = sorted(items, key=lambda x: (priority_map.get(x.type, 99), -x.score))
+    result: list[RetrievalItem] = []
+    used = 0
+
+    for index, item in enumerate(sorted_items):
+        if limit is not None and len(result) >= limit:
+            if diagnostics:
+                for excluded in sorted_items[index:]:
+                    diagnostics.exclude(excluded.id, "priority_budget_trimming", "result_limit")
+            return result, used, "result_limit"
+        item_len = len(item.content)
+        if used + item_len <= budget:
+            result.append(item)
+            used += item_len
+        elif diagnostics:
+            diagnostics.exclude(item.id, "priority_budget_trimming", "character_budget_exceeded")
         if used >= budget:
             return result, used, "budget_met"
 
@@ -364,6 +414,12 @@ def _parse_iso_dt(value: str | None) -> datetime | None:
     return dt
 
 
+def _bridge_spaces(f):
+    if f.bridge_project_ids is not None:
+        return list(f.bridge_project_ids)
+    return [f.bridge_project_id] if f.bridge_project_id is not None else None
+
+
 def _archive_filter_sql(f: "RetrievalFilters", alias: str = "ra") -> tuple[str, dict]:
     """SQL WHERE fragments + params for archive-backed candidates (GPT5.6 #4).
 
@@ -373,6 +429,9 @@ def _archive_filter_sql(f: "RetrievalFilters", alias: str = "ra") -> tuple[str, 
     """
     clauses: list[str] = []
     params: dict = {}
+    if _bridge_spaces(f) is not None:
+        clauses.append(f"AND EXISTS (SELECT 1 FROM bridge_archives ba WHERE ba.archive_id = {alias}.id AND ba.project_id = ANY(:bridge_projects))")
+        params['bridge_projects'] = _bridge_spaces(f)
     sources = _normalize_source_filter(f.source_system)
     if sources:
         params["f_sources"] = sources
@@ -410,6 +469,16 @@ def _canonical_time_sql(f: "RetrievalFilters") -> tuple[str, dict]:
     """Time-range WHERE fragments + params for the canonical query (GPT5.6 #4)."""
     clauses: list[str] = []
     params: dict = {}
+    if _bridge_spaces(f) is not None:
+        clauses.append("""AND EXISTS (
+            SELECT 1 FROM bridge_archives ba JOIN raw_archive ra ON ra.id = ba.archive_id
+            WHERE ba.archive_id = cm.raw_archive_id AND ba.project_id = ANY(:bridge_projects)
+              AND ra.deleted_at IS NULL)
+            AND (cm.fact_id IS NULL OR EXISTS (
+                SELECT 1 FROM facts cf WHERE cf.id = cm.fact_id
+                AND cf.raw_archive_id = cm.raw_archive_id
+                AND cf.source_status = 'active' AND cf.review_status = 'active'))""")
+        params['bridge_projects'] = _bridge_spaces(f)
     start = _parse_iso_dt(f.time_range_start)
     if start is not None:
         params["f_time_start"] = start
@@ -666,6 +735,7 @@ async def _semantic_candidates(
             text("""
                 SELECT summary_text FROM summaries
                 WHERE raw_archive_id = :aid AND source_status = 'active'
+                ORDER BY created_at, id
                 LIMIT 1
             """),
             {"aid": row["raw_archive_id"]},
@@ -709,6 +779,8 @@ async def _traverse_links(
     session: AsyncSession,
     archive_ids: list[str],
     max_links: int = 10,
+    bridge_project_id: str | None = None,
+    bridge_project_ids: tuple[str, ...] | None = None,
 ) -> list[dict]:
     """Find linked facts for the given archive items and return them as candidates.
 
@@ -721,8 +793,17 @@ async def _traverse_links(
     if not archive_ids:
         return []
 
+    scope_sql = ""
+    scope_params = {}
+    scope_ids = list(bridge_project_ids) if bridge_project_ids is not None else ([bridge_project_id] if bridge_project_id is not None else None)
+    if scope_ids is not None:
+        scope_sql = """AND EXISTS (SELECT 1 FROM bridge_archives ba
+            WHERE ba.archive_id = tf.raw_archive_id AND ba.project_id = ANY(:bridge_projects))
+            AND EXISTS (SELECT 1 FROM bridge_archives ba JOIN raw_archive sr ON sr.id = ba.archive_id
+            WHERE ba.archive_id = sf.raw_archive_id AND ba.project_id = ANY(:bridge_projects) AND sr.deleted_at IS NULL)"""
+        scope_params['bridge_projects'] = scope_ids
     rows = (await session.execute(
-        text("""
+        text(f"""
             SELECT
                 ml.id::text AS link_id,
                 ml.link_type,
@@ -745,10 +826,11 @@ async def _traverse_links(
                             AND tf.review_status = 'active'
               AND ra.deleted_at IS NULL
               AND ml.link_type != 'contradicts'
+              {scope_sql}
             ORDER BY ml.confidence DESC
             LIMIT :max_links
         """),
-        {"archive_ids": archive_ids, "max_links": max_links},
+        {"archive_ids": archive_ids, "max_links": max_links, **scope_params},
     )).mappings().all()
 
     seen_fact_ids: set[str] = set()
@@ -851,6 +933,14 @@ async def retrieve(
         )
     cache_key = _cache_key(req)
     cache_allowed = diagnostics is None
+    scoped = _bridge_spaces(req.filters) is not None
+    if diagnostics is not None and scoped:
+        diagnostics.filters.pop("bridge_project_id", None)
+        diagnostics.filters.pop("bridge_project_ids", None)
+        if not diagnostics.memory_space_ids:
+            diagnostics.memory_space_ids = sorted(_bridge_spaces(req.filters) or [])
+    if scoped:
+        cache_allowed = False
     if cache_allowed and cache_key in _cache:
         logger.debug("Retrieval cache hit for query=%r", req.query[:50])
         # NOTE: Audit events are intentionally NOT emitted on cache hits.
@@ -886,7 +976,6 @@ async def retrieve(
             session, req.query, RRF_CANDIDATES_PER_MODE,
             tags=req.filters.tags or None, filters=req.filters,
         )
-
         if diagnostics is not None:
             if len(kw_candidates) >= RRF_CANDIDATES_PER_MODE:
                 diagnostics.record_unknown_exclusion("lexical_sql_limit", "not_observable_at_this_stage")
@@ -901,13 +990,30 @@ async def retrieve(
             # GPT5.6 #4: fuse on a stable cross-modal identity so the same
             # conversation ranked by both modes combines its votes (was fused on
             # per-mode row ids that can never match across modes).
-            candidates = _merge_rrf(kw_candidates, sem_candidates, diagnostics=diagnostics)
+            default_diagnostics = diagnostics if not scoped else None
+            candidates = _merge_rrf(
+                kw_candidates,
+                sem_candidates,
+                diagnostics=default_diagnostics,
+            )
+            if scoped:
+                candidates = _merge_rrf_limited(
+                    kw_candidates,
+                    sem_candidates,
+                    limit=RRF_CANDIDATES_PER_MODE,
+                    diagnostics=diagnostics,
+                )
 
     # ── Link traversal — fetch linked facts for direct candidates ────────────
     direct_archive_ids = list({c["source_id"] for c in candidates if c.get("source_id")})
     try:
         async with session.begin_nested():
-            linked_candidates = await _traverse_links(session, direct_archive_ids)
+            if scoped:
+                linked_candidates = await _traverse_links(
+                    session, direct_archive_ids, bridge_project_ids=tuple(_bridge_spaces(req.filters)),
+                )
+            else:
+                linked_candidates = await _traverse_links(session, direct_archive_ids)
         # Avoid duplicating items already in candidates
         existing_ids = {c["id"] for c in candidates}
         candidates += [lc for lc in linked_candidates if lc["id"] not in existing_ids]
@@ -940,7 +1046,14 @@ async def retrieve(
         for c in candidates
     ]
 
-    trimmed_items, budget_used, trimming_reason = apply_budget_trimming(items, req.budget, diagnostics=diagnostics)
+    default_diagnostics = diagnostics if not scoped else None
+    trimmed_items, budget_used, trimming_reason = apply_budget_trimming(
+        items, req.budget, diagnostics=default_diagnostics,
+    )
+    if scoped:
+        trimmed_items, budget_used, trimming_reason = _apply_budget_trimming_for_scoped_retrieval(
+            items, req.budget, limit=req.limit, diagnostics=diagnostics,
+        )
 
     response = RetrievalResponse(
         query=req.query,
@@ -956,7 +1069,9 @@ async def retrieve(
         event_type="search" if req.actor == "user_ui" else "mcp_retrieve",
         actor=req.actor,
         operation_metadata={
-            "query_summary": req.query[:100],
+            "query_summary": None if scoped else req.query[:100],
+            "bridge_project_id": req.filters.bridge_project_id,
+            "searched_space_ids": _bridge_spaces(req.filters),
             "result_count": len(trimmed_items),
             "retrieval_mode": effective_mode,
             "degraded_mode": degraded,

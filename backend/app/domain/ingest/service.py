@@ -46,6 +46,7 @@ async def ingest_text_content(
     source_type: str | None = None,
     extra_metadata: dict[str, Any] | None = None,
     idempotency_key: str | None = None,
+    commit: bool = True,
 ) -> IngestResult:
     """Ingest plain text or JSON content (paste mode)."""
     content = content.strip()
@@ -82,7 +83,7 @@ async def ingest_text_content(
                 idempotent_replay=True,
             )
 
-    return await _persist_ingest(session=session, parsed=parsed, actor=actor)
+    return await _persist_ingest(session=session, parsed=parsed, actor=actor, commit=commit)
 
 
 async def ingest_file_content(
@@ -117,6 +118,7 @@ async def _persist_ingest(
     session: AsyncSession,
     parsed: ParsedIngest,
     actor: str,
+    commit: bool = True,
 ) -> IngestResult:
     """Persist raw_archive item + audit_event + job stub in a single transaction."""
     archive_item = RawArchiveItem(
@@ -149,7 +151,10 @@ async def _persist_ingest(
     )
     session.add(job)
 
-    await session.commit()
+    if commit:
+        await session.commit()
+    else:
+        await session.flush()
 
     logger.info(
         f"Ingested: id={archive_item.id} type={parsed.source_type} "

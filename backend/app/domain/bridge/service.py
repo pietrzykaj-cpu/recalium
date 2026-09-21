@@ -1,0 +1,458 @@
+"""Three memory operations with authenticated, server-resolved space access."""
+
+import hashlib
+import json
+from dataclasses import asdict
+
+from sqlalchemy import select, text
+
+from app.domain.archive.models import RawArchiveItem
+from app.domain.audit.models import AuditEvent
+from app.domain.bridge.access import permitted_spaces
+from app.domain.bridge.contracts import ContextPacketInput, IngestInput, RetrieveInput, StatusInput
+from app.domain.bridge.models import (
+    BridgeAliasReceipt,
+    BridgeArchive,
+    BridgeBinding,
+    BridgeClient,
+    BridgeReceipt,
+)
+from app.domain.canonical_memory.models import CanonicalMemoryItem
+from app.domain.context_packets.service import build_context_packet
+from app.domain.derived_memory.models import Fact, Summary
+from app.domain.ingest.service import ingest_text_content
+from app.domain.jobs.models import Job
+from app.domain.retrieval.service import (
+    RetrievalFilters,
+    RetrievalItem,
+    RetrievalRequest,
+    RetrievalResponse,
+    retrieve,
+)
+
+
+class BridgeError(Exception):
+    def __init__(self, status, code):
+        self.status, self.code = status, code
+        super().__init__(code)
+
+
+def digest(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def audit(session, actor, operation, project, outcome, **details):
+    session.add(
+        AuditEvent(
+            event_type="bridge_access",
+            actor=actor,
+            operation_metadata=dict(
+                operation=operation, project_id=project, outcome=outcome, **details
+            ),
+        )
+    )
+
+
+async def _lock_receipt(session, *parts):
+    value = int.from_bytes(
+        hashlib.sha256(json.dumps(parts).encode()).digest()[:8], "big", signed=True
+    )
+    await session.execute(text("SELECT pg_advisory_xact_lock(:lock)"), {"lock": value})
+
+
+async def _destination(session, actor, req):
+    if req.project_id is not None:
+        return req.project_id, None
+    if req.space_id is not None:
+        return req.space_id, None
+    await _lock_receipt(session, actor, "alias", req.destination, digest(req.idempotency_key))
+    pinned = await session.get(
+        BridgeAliasReceipt, (actor, req.destination, digest(req.idempotency_key))
+    )
+    if pinned:
+        return pinned.project_id, pinned
+    binding = await session.get(BridgeBinding, (actor, req.destination))
+    if binding is None:
+        raise BridgeError(403, "destination_unavailable")
+    return binding.project_id, None
+
+
+async def execute(session, authorization, operation, request):
+    actor = "unauthenticated"
+    resolved = []
+    destination = None
+    try:
+        scheme, _, credential = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not 32 <= len(credential) <= 256:
+            raise BridgeError(401, "authentication_required")
+        principal = (
+            await session.execute(
+                select(BridgeClient)
+                .where(
+                    BridgeClient.credential_digest == digest(credential),
+                    BridgeClient.active.is_(True),
+                )
+                .with_for_update(read=True)
+            )
+        ).scalar_one_or_none()
+        if principal is None:
+            raise BridgeError(401, "authentication_required")
+        actor = principal.id
+        if operation == "ingest_memory":
+            destination, pinned = await _destination(session, actor, request)
+            spaces = await permitted_spaces(session, actor, [destination], write=True)
+            if destination not in spaces:
+                raise BridgeError(403, "permission_denied")
+            space = spaces[destination]
+            if request.destination is not None and request.destination != space.kind:
+                raise BridgeError(403, "destination_unavailable")
+            resolved = [destination]
+            response = await _ingest(
+                session, actor, request, destination, pinned=pinned is not None
+            )
+            if request.destination is not None and request.space_id is None and pinned is None:
+                session.add(
+                    BridgeAliasReceipt(
+                        client_id=actor,
+                        destination=request.destination,
+                        request_digest=digest(request.idempotency_key),
+                        project_id=destination,
+                    )
+                )
+            response["memory_space"] = _space_label(space)
+        else:
+            requested = (
+                [request.project_id]
+                if request.project_id is not None
+                else getattr(request, "space_ids", None)
+            )
+            spaces = await permitted_spaces(session, actor, requested)
+            if requested is not None and not set(requested).issubset(spaces):
+                raise BridgeError(403, "permission_denied")
+            resolved = sorted(spaces)
+            if operation == "retrieve_memory":
+                response = await _retrieve(session, actor, request, spaces)
+            elif operation == "build_context_packet":
+                response = await _context_packet(session, actor, request, spaces)
+            elif operation == "get_ingest_status":
+                response = await _status(session, request, spaces)
+            else:
+                raise BridgeError(400, "unknown_operation")
+        audit(
+            session,
+            actor,
+            operation,
+            destination or request.project_id,
+            "allowed",
+            searched_space_ids=(
+                resolved
+                if operation in ("retrieve_memory", "build_context_packet")
+                else []
+            ),
+            resolved_destination=destination,
+            result_count=len(response.get("items", response.get("selected", []))),
+            replay=response.get("idempotent_replay", False),
+        )
+        await session.commit()
+        return response
+    except BridgeError as exc:
+        await session.rollback()
+        audit(session, actor, operation, None, "denied", code=exc.code)
+        await session.commit()
+        raise
+    except Exception:
+        await session.rollback()
+        audit(session, actor, operation, None, "error")
+        await session.commit()
+        raise
+
+
+def _space_label(space):
+    return {"id": space.id, "kind": space.kind}
+
+
+async def _ingest(session, actor, req: IngestInput, destination, *, pinned=False):
+    request_digest = digest(req.idempotency_key)
+    # Same canonical payload as v1: aliases cannot change receipt meaning.
+    payload = {
+        "project_id": destination,
+        "content": req.content,
+        "source_metadata": req.source_metadata.model_dump(),
+    }
+    fingerprint = digest(json.dumps(payload, sort_keys=True))
+    await _lock_receipt(session, actor, "space", destination, request_digest)
+    receipt = await session.get(BridgeReceipt, (actor, destination, request_digest))
+    if pinned and receipt is None:
+        raise BridgeError(409, "source_unavailable")
+    if receipt:
+        if receipt.payload_digest != fingerprint:
+            raise BridgeError(409, "idempotency_conflict")
+        archive = await session.get(RawArchiveItem, receipt.archive_id)
+        assignment = await session.get(BridgeArchive, receipt.archive_id)
+        if (
+            archive is None
+            or archive.deleted_at is not None
+            or assignment is None
+            or assignment.project_id != destination
+        ):
+            raise BridgeError(409, "source_unavailable")
+        archive_id = receipt.archive_id
+    else:
+        result = await ingest_text_content(
+            session,
+            req.content,
+            actor=actor,
+            source_type="bridge",
+            source_name=req.source_metadata.source_name,
+            extra_metadata={
+                "client_identity": actor,
+                "source_metadata": req.source_metadata.model_dump(),
+                "project_hint": destination,
+                "processing_mode": "local_only",
+                "import_method": "memory_bridge_v1",
+            },
+            commit=False,
+        )
+        archive_id = result.archive_ids[0]
+        session.add(BridgeArchive(archive_id=archive_id, project_id=destination, client_id=actor))
+        session.add(
+            BridgeReceipt(
+                client_id=actor,
+                project_id=destination,
+                request_digest=request_digest,
+                payload_digest=fingerprint,
+                archive_id=archive_id,
+            )
+        )
+    return {
+        "status": "accepted",
+        "archive_id": str(archive_id),
+        "project_id": destination,
+        "client_identity": actor,
+        "idempotent_replay": receipt is not None,
+    }
+
+
+async def _processing(session, item):
+    """Read recorded processing provenance; never infer it from the search engine."""
+    processing = {"method": None, "model": None}
+    if item["type"] == "canonical":
+        cm = (
+            await session.execute(
+                select(CanonicalMemoryItem).where(
+                    CanonicalMemoryItem.id == item["id"],
+                    CanonicalMemoryItem.raw_archive_id == item["source_id"],
+                    CanonicalMemoryItem.source_status == "active",
+                    CanonicalMemoryItem.status == "active",
+                )
+            )
+        ).scalar_one_or_none()
+        if cm is None:
+            raise BridgeError(403, "source_scope_violation")
+        if cm.fact_id is None:
+            return {"method": "canonical_promotion", "model": None}
+        fact_id = cm.fact_id
+    elif item["type"] == "fact":
+        fact_id = item["id"]
+    else:
+        fact_id = None
+    if fact_id is not None:
+        fact = (
+            await session.execute(
+                select(Fact).where(
+                    Fact.id == fact_id,
+                    Fact.raw_archive_id == item["source_id"],
+                    Fact.source_status == "active",
+                    Fact.review_status == "active",
+                )
+            )
+        ).scalar_one_or_none()
+        if fact is None:
+            raise BridgeError(403, "source_scope_violation")
+        processing = {"method": fact.derivation_method, "model": fact.derivation_model}
+    elif item["type"] == "summary":
+        summary = (
+            await session.execute(
+                select(Summary)
+                .where(
+                    Summary.raw_archive_id == item["source_id"],
+                    Summary.source_status == "active",
+                    Summary.summary_text == item["content"],
+                )
+                .order_by(Summary.created_at, Summary.id)
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if summary is None:
+            raise BridgeError(403, "source_scope_violation")
+        processing = {"method": summary.derivation_method, "model": summary.model_used}
+    return processing
+
+
+async def _retrieve(session, actor, req: RetrieveInput, spaces, diagnostics=None):
+    if spaces:
+        response = asdict(
+            await retrieve(
+                session,
+                RetrievalRequest(
+                    query=req.query,
+                    mode=req.mode,
+                    budget=req.budget,
+                    limit=req.limit,
+                    actor=actor,
+                    filters=RetrievalFilters(bridge_project_ids=tuple(sorted(spaces))),
+                ),
+                diagnostics=diagnostics,
+            )
+        )
+    else:
+        response = {
+            "query": req.query,
+            "retrieval_mode": req.mode,
+            "budget_used": 0,
+            "budget_limit": req.budget,
+            "trimming_reason": "result_exhausted",
+            "items": [],
+            "degraded_mode": False,
+        }
+    for item in response["items"]:
+        row = (
+            await session.execute(
+                select(BridgeArchive, RawArchiveItem)
+                .join(RawArchiveItem, RawArchiveItem.id == BridgeArchive.archive_id)
+                .where(
+                    BridgeArchive.archive_id == item["source_id"],
+                    BridgeArchive.project_id.in_(spaces),
+                    RawArchiveItem.deleted_at.is_(None),
+                )
+                .with_for_update(read=True, of=(BridgeArchive, RawArchiveItem))
+            )
+        ).first()
+        if row is None:
+            raise BridgeError(403, "source_scope_violation")
+        assignment, archive = row
+        if item.get("source_fact_id"):
+            source = (
+                await session.execute(
+                    select(Fact.id)
+                    .join(BridgeArchive, BridgeArchive.archive_id == Fact.raw_archive_id)
+                    .join(RawArchiveItem, RawArchiveItem.id == Fact.raw_archive_id)
+                    .where(
+                        Fact.id == item["source_fact_id"],
+                        BridgeArchive.project_id.in_(spaces),
+                        Fact.source_status == "active",
+                        Fact.review_status == "active",
+                        RawArchiveItem.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+            if source is None:
+                raise BridgeError(403, "source_scope_violation")
+        previous = item["provenance"]
+        item["provenance"] = {
+            "authenticated_client": assignment.client_id,
+            "source_metadata": (archive.metadata_json or {}).get("source_metadata", {}),
+            "project_id": assignment.project_id,
+            "processing": await _processing(session, item),
+            "retrieval": {
+                "method": previous.get("derivation_method"),
+                "model": previous.get("derivation_model"),
+            },
+            "source_excerpt": previous.get("source_excerpt", ""),
+        }
+        item["memory_space"] = _space_label(spaces[assignment.project_id])
+    response["searched_space_ids"] = sorted(spaces)
+    response["project_id"] = req.project_id
+    return response
+
+
+async def _status(session, req: StatusInput, spaces):
+    row = (
+        await session.execute(
+            select(RawArchiveItem, BridgeArchive)
+            .join(BridgeArchive, BridgeArchive.archive_id == RawArchiveItem.id)
+            .where(
+                RawArchiveItem.id == req.archive_id,
+                BridgeArchive.project_id.in_(spaces),
+                RawArchiveItem.deleted_at.is_(None),
+            )
+        )
+    ).first()
+    if row is None:
+        raise BridgeError(404, "not_found")
+    archive, assignment = row
+    jobs = (
+        (
+            await session.execute(
+                select(Job).where(Job.raw_archive_id == archive.id).order_by(Job.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "archive_id": str(archive.id),
+        "project_id": assignment.project_id,
+        "memory_space": _space_label(spaces[assignment.project_id]),
+        "jobs": [
+            {
+                "job_id": str(j.id),
+                "status": j.status,
+                "attempts": j.attempts,
+                "has_error": bool(j.error_message),
+            }
+            for j in jobs
+        ],
+    }
+
+
+async def _context_packet(session, actor, req: ContextPacketInput, spaces):
+    """Retrieve, authorize, enrich provenance, then build a transient packet."""
+    diagnostics = None
+    if req.include_diagnostics:
+        from app.domain.retrieval.diagnostics import RetrievalDiagnosticsCollector
+        diagnostics = RetrievalDiagnosticsCollector(
+            mode=req.mode,
+            filters={},
+            memory_space_ids=sorted(spaces),
+        )
+    if diagnostics is None:
+        enriched = await _retrieve(session, actor, req, spaces)
+    else:
+        enriched = await _retrieve(session, actor, req, spaces, diagnostics=diagnostics)
+    retrieval = RetrievalResponse(
+        query=enriched["query"],
+        retrieval_mode=enriched["retrieval_mode"],
+        budget_used=enriched["budget_used"],
+        budget_limit=enriched["budget_limit"],
+        trimming_reason=enriched["trimming_reason"],
+        degraded_mode=enriched["degraded_mode"],
+        items=[
+            RetrievalItem(
+                id=item["id"],
+                type=item["type"],
+                content=item["content"],
+                score=item["score"],
+                source_id=item["source_id"],
+                source_system=item["source_system"],
+                captured_at=item["captured_at"],
+                conflict_label=item.get("conflict_label"),
+                provenance=item.get("provenance", {}),
+                source_fact_id=item.get("source_fact_id"),
+                link_type=item.get("link_type"),
+            )
+            for item in enriched["items"]
+        ],
+    )
+    diagnostic_snapshot = diagnostics.snapshot() if diagnostics else None
+    packet = build_context_packet(
+        retrieval,
+        token_budget=req.token_budget,
+        provider=req.current_provider,
+        model=req.current_model,
+        diagnostics=diagnostic_snapshot,
+    )
+    result = packet.model_dump(mode="json")
+    if diagnostic_snapshot:
+        result["retrieval_diagnostics"] = diagnostic_snapshot.model_dump(mode="json")
+    return result

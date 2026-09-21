@@ -42,7 +42,7 @@ def get_engine():
         settings = get_settings()
         _engine = create_async_engine(
             get_database_url(),
-            echo=settings.app_env == "development",
+            echo=False,  # Memory content and authentication digests must not enter SQL logs.
             pool_pre_ping=True,
             pool_size=5,
             max_overflow=10,

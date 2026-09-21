@@ -1,0 +1,1 @@
+"""Local, authenticated memory bridge."""
