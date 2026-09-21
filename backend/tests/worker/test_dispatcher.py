@@ -68,6 +68,9 @@ async def test_invalid_key_causes_retryable_failed(db_session_phase2, monkeypatc
         fake_summarize,
     )
 
+    # Select an available provider as well as reporting availability.
+    monkeypatch.setattr("app.worker.dispatcher._resolve_provider", lambda configured: "openai")
+
     # Also mock _has_llm_provider to return True so the LLM path is entered
     monkeypatch.setattr("app.worker.dispatcher._has_llm_provider", lambda: True)
 

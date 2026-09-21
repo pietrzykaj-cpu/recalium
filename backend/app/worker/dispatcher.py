@@ -19,9 +19,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
-from typing import Any
+from ipaddress import ip_address
+from typing import Any, Literal
+from urllib.parse import urlsplit
 
+from pydantic import BaseModel, ConfigDict, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.jobs.models import Job
@@ -176,18 +180,81 @@ def _parse_json_object(raw: str) -> dict:
     return obj
 
 
-async def _ollama_chat(system: str, user: str, *, format_json: bool = False) -> str:
-    """Call Ollama's native /api/chat with thinking disabled.
+class _OllamaFact(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
 
-    The OpenAI-compat endpoint cannot disable thinking; reasoning models
-    (qwen3.x etc.) then spend the whole token budget on the thinking trace and
-    return EMPTY content with finish_reason=length. The native API supports
-    `think: false` and `format: "json"` (structured output for extraction).
-    Falls back to a request without `think` for models/servers that reject it.
+    fact_text: str
+    source_span: str
+    confidence_tier: Literal["high", "medium", "low"]
+    entities: list[str]
+    tags: list[str]
+
+
+class _OllamaExtraction(BaseModel):
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    facts: list[_OllamaFact]
+
+
+def _ollama_final_content(raw: str) -> str:
+    """Separate explicit thinking blocks, including a template-prefilled opener.
+
+    Do not guess from prose such as "Okay" or remove tag literals inside JSON.
+    An orphan closing tag must occupy its own line, as in Qwen's native output.
+    """
+    content = raw.strip()
+    while content:
+        if content.startswith("<think>"):
+            end = content.find("</think>", len("<think>"))
+            if end < 0:
+                raise ValueError("Ollama returned an unfinished thinking block")
+            content = content[end + len("</think>"):].strip()
+            continue
+        # Valid structured output can contain literal protocol tokens as data.
+        try:
+            json.loads(content)
+        except json.JSONDecodeError:
+            closing = re.search(r"(?m)^[ \t]*</think>[ \t]*(?:\r?\n|$)", content)
+            if closing:
+                content = content[closing.end():].strip()
+                continue
+        break
+    if not content:
+        raise ValueError("Ollama returned no final answer")
+    return content
+
+
+def _parse_ollama_facts(raw: str) -> list[dict[str, Any]]:
+    """A missing/invalid facts envelope is a provider failure, never zero facts."""
+    try:
+        content = raw.strip()
+        fenced = re.fullmatch(r"```(?:json)?\s*\n(.*?)\n```", content, re.DOTALL)
+        obj = json.loads(fenced.group(1) if fenced else content)
+    except json.JSONDecodeError:
+        raise ValueError("Ollama extraction returned invalid JSON") from None
+    try:
+        result = _OllamaExtraction.model_validate(obj)
+    except ValidationError:
+        # Do not include Pydantic's input values (memory text) in job errors.
+        raise ValueError("Ollama extraction response does not match the facts schema") from None
+    logger.info("Ollama extraction returned %d facts", len(result.facts))
+    return [fact.model_dump() for fact in result.facts]
+
+
+async def _ollama_chat(
+    system: str, user: str, *, format_json: bool = False, allow_external: bool = True,
+) -> str:
+    """Call Ollama's native API and return only its final answer.
+
+    A thinking-only Qwen checkpoint can emit reasoning despite think=False.
+    Preserve the working request mode (native thinking with structured output
+    can be very slow), and separate its explicit protocol boundary on return.
     """
     import httpx  # noqa: PLC0415
 
     settings = get_settings()
+    if not allow_external and not _is_local_ollama_url(settings.ollama_base_url):
+        raise PermissionError("Policy forbids remote Ollama processing")
     payload: dict[str, Any] = {
         "model": settings.ollama_model,
         "messages": [
@@ -199,23 +266,22 @@ async def _ollama_chat(system: str, user: str, *, format_json: bool = False) -> 
         "options": {"temperature": 0},
     }
     if format_json:
-        payload["format"] = "json"
+        payload["format"] = _OllamaExtraction.model_json_schema()
     headers = (
         {"Authorization": f"Bearer {settings.ollama_api_key}"}
         if settings.ollama_api_key
         else None
     )
     url = f"{settings.ollama_base_url.rstrip('/')}/api/chat"
-    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(300.0, connect=10.0),
+        follow_redirects=False, trust_env=allow_external,
+    ) as client:
         resp = await client.post(url, json=payload, headers=headers)
-        if resp.status_code == 400 and "think" in payload:
-            # Model/server that rejects the think parameter
-            payload.pop("think")
-            resp = await client.post(url, json=payload, headers=headers)
         resp.raise_for_status()
-        return resp.json().get("message", {}).get("content") or ""
+        return _ollama_final_content(resp.json().get("message", {}).get("content") or "")
 
-async def _run_summarize_job(text: str) -> str | None:
+async def _run_summarize_job(text: str, *, allow_external: bool = True) -> str | None:
     """Run LLM summarization via the configured provider/model (F1/F2).
 
     Reads API keys from settings at call time (never from DB or job record).
@@ -224,7 +290,7 @@ async def _run_summarize_job(text: str) -> str | None:
     """
     settings = get_settings()
     provider = _resolve_provider(settings.summarize_provider)
-    if provider is None:
+    if provider is None or not _provider_allowed(provider, allow_external=allow_external):
         return None
     model = _resolve_model(provider, settings.summarize_model)
 
@@ -255,10 +321,12 @@ async def _run_summarize_job(text: str) -> str | None:
         return response.content[0].text
 
     # provider == "ollama"
-    return await _ollama_chat(SUMMARIZATION_SYSTEM_PROMPT, text)
+    return await _ollama_chat(
+        SUMMARIZATION_SYSTEM_PROMPT, text, allow_external=allow_external,
+    )
 
 
-async def _run_extract_job(text: str) -> list[dict[str, Any]]:
+async def _run_extract_job(text: str, *, allow_external: bool = True) -> list[dict[str, Any]]:
     """Run LLM fact extraction over turn-boundary chunks (F3).
 
     Models extract predominantly from the beginning of multi-turn
@@ -269,21 +337,26 @@ async def _run_extract_job(text: str) -> list[dict[str, Any]]:
     Raises exception on API error (caller converts to retryable_failed).
     """
     settings = get_settings()
-    if _resolve_provider(settings.extract_provider) is None:
+    if not _provider_allowed(
+        _resolve_provider(settings.extract_provider), allow_external=allow_external,
+    ):
         return []  # No provider available for extraction
 
     facts: list[dict[str, Any]] = []
     for chunk in _split_conversation(text):
-        facts.extend(await _extract_chunk(chunk))
-    facts = _validate_spans(facts, text)  # F4: reject hallucinated spans
-    return _dedupe_facts(facts)
+        facts.extend(await _extract_chunk(chunk, allow_external=allow_external))
+    returned_count = len(facts)
+    facts = _validate_spans(facts, text)  # F4: preserve existing provenance checks
+    facts = _dedupe_facts(facts)
+    logger.info("Extraction facts: returned=%d retained=%d", returned_count, len(facts))
+    return facts
 
 
-async def _extract_chunk(text: str) -> list[dict[str, Any]]:
+async def _extract_chunk(text: str, *, allow_external: bool = True) -> list[dict[str, Any]]:
     """Single-call fact extraction for one chunk via the configured provider/model (F1/F2)."""
     settings = get_settings()
     provider = _resolve_provider(settings.extract_provider)
-    if provider is None:
+    if provider is None or not _provider_allowed(provider, allow_external=allow_external):
         return []
     model = _resolve_model(provider, settings.extract_model)
 
@@ -320,12 +393,10 @@ async def _extract_chunk(text: str) -> list[dict[str, Any]]:
             return []
 
     # provider == "ollama"
-    raw = await _ollama_chat(FACT_EXTRACTION_SYSTEM_PROMPT, text, format_json=True)
-    try:
-        return _parse_json_object(raw).get("facts", [])
-    except json.JSONDecodeError:
-        logger.warning("Ollama returned non-JSON facts response (%d chars): %s", len(raw), raw[:200])
-        return []
+    raw = await _ollama_chat(
+        FACT_EXTRACTION_SYSTEM_PROMPT, text, format_json=True, allow_external=allow_external,
+    )
+    return _parse_ollama_facts(raw)
 
 
 async def _run_link_detection_job(
@@ -595,6 +666,30 @@ _PROVIDER_DEFAULT_MODEL = {
 }
 
 
+def _is_local_ollama_url(url: str | None) -> bool:
+    """Trust only loopback and Docker Desktop's host gateway, never arbitrary LAN URLs."""
+    try:
+        parsed = urlsplit(url or "")
+        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+                or parsed.username is not None or parsed.password is not None
+                or parsed.query or parsed.fragment or parsed.path not in {"", "/"}):
+            return False
+        # Accessing port also rejects malformed/out-of-range ports.
+        parsed.port
+        if parsed.hostname in {"localhost", "host.docker.internal"}:
+            return True
+        return ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _provider_allowed(provider: str | None, *, allow_external: bool) -> bool:
+    return provider is not None and (
+        allow_external
+        or (provider == "ollama" and _is_local_ollama_url(get_settings().ollama_base_url))
+    )
+
+
 def _resolve_provider(configured: str) -> str | None:
     """Resolve a configured provider ("auto" | name) to an available provider (F2).
 
@@ -637,7 +732,7 @@ def _provider_name() -> str:
 
 
 def _active_provider_label() -> str | None:
-    """The external provider (openai|anthropic|ollama) that would service LLM calls.
+    """The selected provider (openai|anthropic|ollama) that would service LLM calls.
 
     Distinct from ``_provider_name()``, which returns the MODEL label stored in
     ``fact.derivation_model``. The policy-decision audit records the *provider*, not
@@ -665,7 +760,7 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
     Pipeline order (enforced — gate MUST fire before any external call):
       1. Load raw archive content
       2. Sensitivity gate (blocks personal/relationship/unclassified)
-      3. LLM summarize + extract (skipped if blocked or no provider)
+      3. LLM summarize + extract (each provider authorized independently)
       4. FTS indexing (always runs — local, no external call)
       5. Embeddings and conflict detection wired in plan 05–06
 
@@ -766,6 +861,22 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
         job.id, effective_policy.allow_external, effective_policy.processing_mode,
         effective_policy.sensitivity_hint, effective_policy.data_class,
     )
+    settings = get_settings()
+    operation_providers = {
+        "summarize": _resolve_provider(settings.summarize_provider),
+        "extract": _resolve_provider(settings.extract_provider),
+    }
+    operation_permissions = {
+        operation: {
+            "provider": provider,
+            "local": provider == "ollama" and _is_local_ollama_url(settings.ollama_base_url),
+            "allowed": _provider_allowed(provider, allow_external=effective_policy.allow_external),
+        }
+        for operation, provider in operation_providers.items()
+    }
+    allowed_providers = {
+        decision["provider"] for decision in operation_permissions.values() if decision["allowed"]
+    }
     try:
         from app.domain.audit.models import AuditEvent  # noqa: PLC0415
         session.add(AuditEvent(
@@ -777,11 +888,8 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
                 "processing_mode": effective_policy.processing_mode,
                 "sensitivity_hint": effective_policy.sensitivity_hint,
                 "data_class": effective_policy.data_class,
-                "provider": (
-                    _active_provider_label()
-                    if effective_policy.allow_external and _has_llm_provider()
-                    else None
-                ),
+                "provider": next(iter(allowed_providers)) if len(allowed_providers) == 1 else None,
+                "operations": operation_permissions,
                 "reason": effective_policy.reason,
             },
         ))
@@ -793,19 +901,18 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
         await session.refresh(job)
         policy_audit_recorded = False
 
-    # GPT5.6 #6: fail closed. External egress must never happen without a durable
-    # policy-decision record. If policy would allow external processing but the
-    # decision could not be recorded, block and retry instead of egressing silently.
-    if effective_policy.allow_external and not policy_audit_recorded:
+    # Fail closed for both local and external LLMs: authorization must be durable
+    # before processing. The audit records permissions, not completed calls.
+    if (effective_policy.allow_external or allowed_providers) and not policy_audit_recorded:
         await fail_job(
             session, job,
-            error="Policy decision could not be recorded; external processing blocked (fail-closed).",
+            error="Policy decision could not be recorded; LLM processing blocked (fail-closed).",
             retryable=True,
         )
         return
 
     # ── Step 3: LLM summarize + extract (only if policy allows AND provider configured) ──
-    if effective_policy.allow_external:
+    if effective_policy.allow_external or allowed_providers:
         if not _has_llm_provider():
             # No provider — run FTS first (local, no LLM needed), then mark pending_provider
             try:
@@ -828,15 +935,19 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
         # BYOK-08: Check if summary already exists — skip if present
         existing_summary = await get_existing_summary(session, job.raw_archive_id)
 
-        if existing_summary is None:
+        if existing_summary is None and operation_permissions["summarize"]["allowed"]:
             try:
-                summary_text = await _run_summarize_job(raw_text)
+                summary_text = await _run_summarize_job(
+                    raw_text, allow_external=effective_policy.allow_external,
+                )
                 if summary_text:
                     await write_summary(
                         session,
                         raw_archive_id=job.raw_archive_id,
                         summary_text=summary_text,
-                        model_used=_provider_name(),
+                        model_used=_resolve_model(
+                            operation_providers["summarize"], settings.summarize_model,
+                        ),
                         derivation_method="llm_summarization",
                     )
                     logger.debug("Wrote summary for job %s", job.id)
@@ -853,7 +964,10 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
 
         # Extract facts
         try:
-            facts_data = await _run_extract_job(raw_text)
+            facts_data = (
+                await _run_extract_job(raw_text, allow_external=effective_policy.allow_external)
+                if operation_permissions["extract"]["allowed"] else []
+            )
             enriched_facts = [
                 {**f, "derivation_method": "llm_extraction", "derivation_model": _provider_name()}
                 for f in facts_data
