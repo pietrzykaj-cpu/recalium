@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from datetime import datetime, timezone
 from dataclasses import asdict
 
 from sqlalchemy import select, text
@@ -10,7 +11,7 @@ from app.domain.archive.models import RawArchiveItem
 from app.domain.audit.models import AuditEvent
 from app.domain.bridge.access import permitted_spaces
 from app.domain.authority.repository import evaluate_scope
-from app.domain.bridge.contracts import ContextPacketInput, CurrentAuthorityInput, IngestInput, RetrieveInput, StatusInput
+from app.domain.bridge.contracts import ContextPacketInput, ContinuityHandoffInput, CurrentAuthorityInput, IngestInput, RetrieveInput, StatusInput
 from app.domain.bridge.models import (
     BridgeAliasReceipt,
     BridgeArchive,
@@ -19,7 +20,10 @@ from app.domain.bridge.models import (
     BridgeReceipt,
 )
 from app.domain.canonical_memory.models import CanonicalMemoryItem
+from app.domain.context_packets.contracts import ContextPacket
 from app.domain.context_packets.service import build_context_packet
+from app.domain.agent_succession.contracts import AttributedRecord
+from app.domain.agent_succession.service import build_agent_succession_envelope, render_agent_succession_context
 from app.domain.derived_memory.models import Fact, Summary
 from app.domain.ingest.service import ingest_text_content
 from app.domain.jobs.models import Job
@@ -124,7 +128,7 @@ async def execute(session, authorization, operation, request):
         else:
             requested = (
                 [request.space_id]
-                if operation == "get_current_authority"
+                if operation in ("get_current_authority", "build_continuity_handoff")
                 else (
                     [request.project_id]
                     if request.project_id is not None
@@ -143,6 +147,8 @@ async def execute(session, authorization, operation, request):
                 response = await _status(session, request, spaces)
             elif operation == "get_current_authority":
                 response = await _current_authority(session, request, spaces)
+            elif operation == "build_continuity_handoff":
+                response = await _continuity_handoff(session, actor, request, spaces)
             else:
                 raise BridgeError(400, "unknown_operation")
         audit(
@@ -153,7 +159,7 @@ async def execute(session, authorization, operation, request):
             "allowed",
             searched_space_ids=(
                 resolved
-                if operation in ("retrieve_memory", "build_context_packet")
+                if operation in ("retrieve_memory", "build_context_packet", "build_continuity_handoff")
                 else []
             ),
             resolved_destination=destination,
@@ -335,6 +341,168 @@ async def _current_authority(session, req: CurrentAuthorityInput, spaces):
     }
 
 
+def _stable_unique(values):
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _iter_authority_records(result, name):
+    value = result.get(name)
+    if name == "current_record":
+        return [value] if isinstance(value, dict) else []
+    return value if isinstance(value, list) else []
+
+
+def _snapshot_time(authority_results):
+    values = []
+    for result in authority_results:
+        for name in ("current_record", "competing_records", "historical_records"):
+            for record in _iter_authority_records(result, name):
+                value = record.get("created_at")
+                if value:
+                    try:
+                        values.append(datetime.fromisoformat(value.replace("Z", "+00:00")))
+                    except (TypeError, ValueError):
+                        pass
+    return max(values, default=datetime(1970, 1, 1, tzinfo=timezone.utc))
+
+
+def _authority_decisions(authority_results, *, include_historical):
+    records = []
+    seen = set()
+    for result in authority_results:
+        buckets = ["current_record", "competing_records"]
+        if include_historical:
+            buckets.append("historical_records")
+        for bucket in buckets:
+            for record in _iter_authority_records(result, bucket):
+                if record["id"] in seen:
+                    continue
+                seen.add(record["id"])
+                records.append(AttributedRecord(
+                    id=record["id"],
+                    content=record["content"],
+                    predecessor_ids=list(record.get("superseded_record_ids") or []),
+                    provenance=record.get("provenance") or {},
+                    conflict=result["status"] == "ambiguous",
+                    uncertainty=("historical_or_superseded" if bucket == "historical_records" else None),
+                ))
+    return records
+
+def _authority_lines(authority_results, *, include_historical):
+    lines = ["AUTHORITATIVE CURRENT STATE"]
+    for result in authority_results:
+        key = result["authority_key"]
+        status = result["status"].upper()
+        if result["status"] == "current":
+            current = result["current_record"]
+            lines.append(f"- {key}: CURRENT record {current['id']}: {current['content']}")
+        elif result["status"] == "ambiguous":
+            ids = ", ".join(record["id"] for record in result.get("competing_records") or [])
+            lines.append(f"- {key}: AMBIGUOUS; competing records: {ids or 'unavailable'}; do not guess.")
+        else:
+            lines.append(f"- {key}: {status}; no authoritative current record.")
+        if include_historical and result.get("historical_records"):
+            ids = ", ".join(record["id"] for record in result["historical_records"])
+            lines.append(f"  Historical/superseded records: {ids}.")
+    return lines
+
+
+async def _continuity_handoff(session, actor, req: ContinuityHandoffInput, spaces):
+    """Assemble an authorized, transient continuity handoff without persistence or providers."""
+    if req.space_id not in spaces:
+        raise BridgeError(403, "permission_denied")
+    authority_results = []
+    for key in req.authority_keys:
+        authority_results.append(await _current_authority(
+            session,
+            CurrentAuthorityInput(
+                space_id=req.space_id,
+                workstream_id=req.workstream_id,
+                authority_key=key,
+                include_historical=req.include_historical,
+                include_provenance=req.include_provenance,
+                include_competing=req.include_competing,
+            ),
+            spaces,
+        ))
+    packet_request = ContextPacketInput(
+        space_ids=[req.space_id],
+        query=req.query,
+        mode=req.mode,
+        budget=req.budget,
+        limit=req.limit,
+        token_budget=req.token_budget,
+        current_provider=req.current_agent.provider,
+        current_model=req.current_agent.model,
+        include_diagnostics=req.include_diagnostics,
+    )
+    packet_payload = await _context_packet(
+        session,
+        actor,
+        packet_request,
+        spaces,
+        generated_at=_snapshot_time(authority_results),
+    )
+    packet = ContextPacket.model_validate(packet_payload)
+    envelope = build_agent_succession_envelope(
+        packet,
+        current_agent=req.current_agent,
+        predecessors=req.predecessors,
+        decisions=_authority_decisions(authority_results, include_historical=req.include_historical),
+        generated_at=packet.generated_at,
+    )
+    base_budget = max(200, req.render_max_chars - 1200)
+    rendered_base = render_agent_succession_context(envelope, max_chars=base_budget)
+    lines = _authority_lines(authority_results, include_historical=req.include_historical)
+    lines.extend([
+        "SUPPORTING MEMORY (NON-AUTHORITATIVE)",
+        rendered_base.text,
+    ])
+    rendered_text = "\n".join(lines)
+    if len(rendered_text) > req.render_max_chars:
+        rendered_text = rendered_text[:req.render_max_chars].rstrip()
+    rendered = rendered_base.model_copy(update={
+        "text": rendered_text,
+        "max_chars": req.render_max_chars,
+        "truncated": rendered_base.truncated or len(rendered_text) < len("\n".join(lines)),
+    })
+    warnings = []
+    for result in authority_results:
+        if result["status"] == "ambiguous":
+            warnings.append(f"authority_ambiguous:{result['authority_key']}")
+        elif result["status"] == "empty":
+            warnings.append(f"authority_empty:{result['authority_key']}")
+    warnings.extend(packet.warnings)
+    warnings.extend("unresolved_question_present" for _ in packet.unresolved_questions)
+    warnings.extend(f"supporting_memory_excluded:{item.memory_id}" for item in packet.excluded)
+    if not packet.selected:
+        warnings.append("no_supporting_memory")
+    provenance = None
+    if req.include_provenance:
+        provenance = {
+            "space_id": req.space_id,
+            "workstream_id": req.workstream_id,
+            "authority_keys": list(req.authority_keys),
+            "searched_space_ids": [req.space_id],
+            "authority_source": "persisted_authority_records",
+            "memory_source": "ordinary_authorized_retrieval",
+        }
+    return {
+        "authority_results": authority_results,
+        "context_packet": packet.model_dump(mode="json"),
+        "included_memory_ids": [item.memory_id for item in packet.selected],
+        "excluded_memory_ids": [item.memory_id for item in packet.excluded],
+        "unresolved_questions": list(packet.unresolved_questions),
+        "flags": list(packet.flags),
+        "provenance": provenance,
+        "packet_integrity": packet.integrity.model_dump(mode="json"),
+        "predecessors": [item.model_dump(mode="json") for item in req.predecessors],
+        "current_agent": req.current_agent.model_dump(mode="json"),
+        "succession_envelope": envelope.model_dump(mode="json"),
+        "rendered_handoff": rendered.model_dump(mode="json"),
+        "warnings": _stable_unique(warnings),
+    }
+
 async def _retrieve(session, actor, req: RetrieveInput, spaces, diagnostics=None):
     if spaces:
         response = asdict(
@@ -452,7 +620,7 @@ async def _status(session, req: StatusInput, spaces):
     }
 
 
-async def _context_packet(session, actor, req: ContextPacketInput, spaces):
+async def _context_packet(session, actor, req: ContextPacketInput, spaces, generated_at=None):
     """Retrieve, authorize, enrich provenance, then build a transient packet."""
     diagnostics = None
     if req.include_diagnostics:
@@ -497,6 +665,7 @@ async def _context_packet(session, actor, req: ContextPacketInput, spaces):
         provider=req.current_provider,
         model=req.current_model,
         diagnostics=diagnostic_snapshot,
+        generated_at=generated_at,
     )
     result = packet.model_dump(mode="json")
     if diagnostic_snapshot:

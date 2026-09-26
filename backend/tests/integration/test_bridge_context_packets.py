@@ -68,5 +68,5 @@ async def test_opt_in_rest_and_mcp_surfaces_are_registered() -> None:
 
     tool_names = {tool.name for tool in await bridge_mcp.list_tools()}
     assert tool_names == {
-        "retrieve_memory", "build_context_packet", "ingest_memory", "get_ingest_status",
+        "retrieve_memory", "build_context_packet", "build_continuity_handoff", "get_current_authority", "ingest_memory", "get_ingest_status",
     }

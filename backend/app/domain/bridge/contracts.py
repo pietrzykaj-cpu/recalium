@@ -5,6 +5,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.domain.agent_succession.contracts import CurrentAgent, Predecessor
+
 ProjectId = Annotated[str, Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")]
 
 
@@ -74,3 +76,31 @@ class CurrentAuthorityInput(StrictInput):
     include_historical: bool = False
     include_provenance: bool = False
     include_competing: bool = True
+
+class ContinuityHandoffInput(StrictInput):
+    """Read-only authority + retrieval + succession handoff request."""
+    space_id: ProjectId
+    workstream_id: str = Field(min_length=1, max_length=128)
+    authority_keys: list[str] = Field(min_length=1, max_length=32)
+    query: str = Field(min_length=1, max_length=2000)
+    mode: Literal["keyword", "semantic", "hybrid"] = "hybrid"
+    budget: int = Field(default=2000, ge=1, le=20000)
+    limit: int = Field(default=20, ge=1, le=50)
+    token_budget: int = Field(default=500, ge=0, le=50000)
+    render_max_chars: int = Field(default=8000, ge=512, le=50000)
+    current_agent: CurrentAgent = Field(default_factory=CurrentAgent)
+    predecessors: list[Predecessor] = Field(default_factory=list, max_length=32)
+    include_historical: bool = False
+    include_provenance: bool = False
+    include_competing: bool = True
+    include_diagnostics: bool = False
+
+    @model_validator(mode="after")
+    def normalize_authority_keys(self):
+        keys = [key.strip() for key in self.authority_keys]
+        if any(not key or len(key) > 255 for key in keys):
+            raise ValueError("authority_keys must be non-empty and at most 255 characters")
+        if len(set(keys)) != len(keys):
+            raise ValueError("authority_keys must be unique")
+        self.authority_keys = sorted(keys)
+        return self
