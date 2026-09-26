@@ -265,15 +265,13 @@ async def execute(session, authorization, operation, request):
         raise
     except Exception as exc:
         await session.rollback()
-        code = (
-            "authority_persistence_failure"
-            if operation in AUTHORITY_WRITE_HANDLERS
-            else None
-        )
-        audit(session, actor, operation, None, "error", code=code)
-        await session.commit()
-        if code:
+        if operation in AUTHORITY_WRITE_HANDLERS:
+            code = "authority_persistence_failure"
+            audit(session, actor, operation, None, "error", code=code)
+            await session.commit()
             raise BridgeError(500, code) from exc
+        audit(session, actor, operation, None, "error")
+        await session.commit()
         raise
 
 
