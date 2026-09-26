@@ -1,8 +1,9 @@
 """Bridge ownership is explicit; legacy archive metadata grants no access."""
 
 import uuid
+from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, CheckConstraint, ForeignKey, String
+from sqlalchemy import JSON, TIMESTAMP, Boolean, CheckConstraint, ForeignKey, Index, String
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -39,6 +40,35 @@ class BridgeGrant(Base):
     project_id: Mapped[str] = mapped_column(ForeignKey("bridge_projects.id"), primary_key=True)
     can_read: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     can_write: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    can_propose_authority: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    can_mutate_authority: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
+
+class AuthorityMutationReceipt(Base):
+    """Client-scoped idempotency result for an authority write."""
+
+    __tablename__ = "authority_mutation_receipts"
+    client_id: Mapped[str] = mapped_column(
+        ForeignKey("bridge_clients.id"), primary_key=True
+    )
+    request_digest: Mapped[str] = mapped_column(String(64), primary_key=True)
+    payload_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    operation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    operation_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    result_json: Mapped[dict] = mapped_column(JSON, nullable=False)
+    audit_event_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("audit_events.id"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, default=lambda: datetime.now(UTC)
+    )
+    __table_args__ = (
+        Index("ix_authority_mutation_receipts_operation", "operation_id", unique=True),
+    )
 
 
 class BridgeArchive(Base):

@@ -98,6 +98,19 @@ class AuthorityGraph:
         self._records: dict[str, AuthorityRecord] = {}
         self._edges: list[AuthorityEdge] = []
 
+    @classmethod
+    def from_state(
+        cls,
+        records: list[AuthorityRecord] | tuple[AuthorityRecord, ...],
+        edges: list[AuthorityEdge] | tuple[AuthorityEdge, ...],
+    ) -> AuthorityGraph:
+        """Hydrate a persisted graph without inventing new transitions."""
+        graph = cls()
+        for record in records:
+            graph.create_record(record)
+        graph._edges.extend(edges)
+        return graph
+
     @property
     def records(self) -> tuple[AuthorityRecord, ...]:
         return tuple(self._records.values())

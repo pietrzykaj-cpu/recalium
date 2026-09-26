@@ -69,6 +69,8 @@ async def provision(args):
                 grant = BridgeGrant(client_id=args.client, project_id=args.project)
                 session.add(grant)
             grant.can_read, grant.can_write = args.read, args.write
+            grant.can_propose_authority = getattr(args, "propose_authority", False)
+            grant.can_mutate_authority = getattr(args, "mutate_authority", False)
             destination = getattr(args, "bind", None)
             if destination:
                 if destination != space.kind or not args.write:
@@ -91,6 +93,8 @@ async def provision(args):
             client_id=args.client,
             revoked=args.revoke,
             destination_binding=getattr(args, "bind", None),
+            can_propose_authority=getattr(args, "propose_authority", False),
+            can_mutate_authority=getattr(args, "mutate_authority", False),
         )
         await session.commit()
 
@@ -104,6 +108,8 @@ def main():
     parser.add_argument("--credential-env")
     parser.add_argument("--read", action="store_true")
     parser.add_argument("--write", action="store_true")
+    parser.add_argument("--propose-authority", action="store_true")
+    parser.add_argument("--mutate-authority", action="store_true")
     parser.add_argument("--revoke", action="store_true")
     args = parser.parse_args()
     asyncio.run(provision(args))
