@@ -1,10 +1,10 @@
 """Read-only authority exposure tests; disposable PostgreSQL only."""
 
-from datetime import datetime, timezone
+import hashlib
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import uuid4
 
-import hashlib
 import pytest
 
 from app.api import bridge as bridge_module
@@ -12,7 +12,7 @@ from app.domain.authority.contracts import AuthorityRecord
 from app.domain.authority.repository import create_record, mark_disputed, supersede, withdraw
 from app.domain.bridge.models import BridgeClient, BridgeGrant, BridgeProject
 
-NOW = datetime(2026, 9, 26, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 9, 26, 12, 0, tzinfo=UTC)
 
 
 def record(*, space="shared", workstream="bootstrap", key="state", status="proposed", content="synthetic", provenance=None):
@@ -188,10 +188,16 @@ async def test_cross_space_isolation_and_input_validation(client, identity, db_s
 
 
 @pytest.mark.asyncio
-async def test_authority_mcp_catalog_is_read_only():
+async def test_authority_mcp_catalog_separates_reads_proposals_and_mutations():
     tools = await bridge_module.bridge_mcp.list_tools()
     names = {tool.name for tool in tools}
     assert "get_current_authority" in names
     tool = next(tool for tool in tools if tool.name == "get_current_authority")
     assert tool.annotations.readOnlyHint is True
-    assert not any(name in names for name in {"create_authority", "activate_authority", "supersede_authority", "withdraw_authority", "dispute_authority"})
+    assert {
+        "create_authority_proposal",
+        "activate_authority_record",
+        "supersede_authority_record",
+        "withdraw_authority_record",
+        "mark_authority_disputed",
+    }.issubset(names)

@@ -7,8 +7,8 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_bridge_builds_packet_after_enriched_retrieval(monkeypatch) -> None:
-    from app.domain.bridge.contracts import ContextPacketInput
     from app.domain.bridge import service as bridge_service
+    from app.domain.bridge.contracts import ContextPacketInput
 
     enriched = {
         "query": "continuity", "retrieval_mode": "hybrid", "budget_used": 8,
@@ -37,8 +37,8 @@ async def test_bridge_builds_packet_after_enriched_retrieval(monkeypatch) -> Non
 
 @pytest.mark.asyncio
 async def test_bridge_diagnostics_are_explicitly_opt_in(monkeypatch) -> None:
-    from app.domain.bridge.contracts import ContextPacketInput
     from app.domain.bridge import service as bridge_service
+    from app.domain.bridge.contracts import ContextPacketInput
 
     async def fake_retrieve(session, actor, request, spaces, diagnostics=None):
         assert diagnostics is not None
@@ -68,5 +68,15 @@ async def test_opt_in_rest_and_mcp_surfaces_are_registered() -> None:
 
     tool_names = {tool.name for tool in await bridge_mcp.list_tools()}
     assert tool_names == {
-        "retrieve_memory", "build_context_packet", "build_continuity_handoff", "get_current_authority", "ingest_memory", "get_ingest_status",
+        "retrieve_memory",
+        "build_context_packet",
+        "build_continuity_handoff",
+        "get_current_authority",
+        "ingest_memory",
+        "get_ingest_status",
+        "create_authority_proposal",
+        "activate_authority_record",
+        "supersede_authority_record",
+        "withdraw_authority_record",
+        "mark_authority_disputed",
     }

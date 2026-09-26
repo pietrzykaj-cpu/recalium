@@ -9,9 +9,17 @@ The existing app mounts a separate authenticated surface:
 - `POST /bridge/v1/retrieve_memory`
 - `POST /bridge/v1/ingest_memory` (202 means accepted, not processed)
 - `POST /bridge/v1/get_ingest_status`
+- `POST /bridge/v1/get_current_authority`
+- `POST /bridge/v1/build_context_packet`
+- `POST /bridge/v1/build_continuity_handoff`
+- `POST /bridge/v1/create_authority_proposal`
+- `POST /bridge/v1/activate_authority_record`
+- `POST /bridge/v1/supersede_authority_record`
+- `POST /bridge/v1/withdraw_authority_record`
+- `POST /bridge/v1/mark_authority_disputed`
 - Streamable HTTP MCP: `http://127.0.0.1:8000/bridge/mcp`
 
-The MCP catalog contains exactly those three tools. Each tool accepts one `data` object with the same shape as the corresponding REST body. Retrieval and status are annotated read-only; ingestion is append-only and requires an idempotency key. MCP failures set `isError`; REST uses 401/403/404/409/422 as appropriate.
+The MCP catalog parallels these REST operations. Each tool accepts one `data` object with the same shape as the corresponding REST body. Read operations are annotated read-only; ingestion and authority proposal are non-destructive idempotent writes; authority mutations are destructive idempotent writes. MCP failures set `isError`; REST uses 401/403/404/409/422/500 as appropriate.
 
 All bridge HTTP requests, including MCP discovery, require `Authorization: Bearer <client credential>`, even when the app's legacy localhost authentication is disabled. Tokens and project memberships are checked from the database without a permissions cache. An app-wide owner bearer is not a bridge client credential. Browser Origin headers and non-loopback Host names are rejected; keep the Docker host binding on 127.0.0.1. Host checks do not replace the loopback binding or authentication.
 
@@ -22,7 +30,7 @@ New installations have no bridge clients or grants and therefore reject every br
 The operator command runs in the backend environment with `DATABASE_URL` configured. The named credential variable must already be in that process's environment:
 
 ```text
-python -m app.domain.bridge.admin --client qwen --project shared --credential-env BRIDGE_QWEN_CREDENTIAL --read --write
+python -m app.domain.bridge.admin --client qwen --project shared --credential-env BRIDGE_QWEN_CREDENTIAL --read --write --propose-authority
 python -m app.domain.bridge.admin --client sol --project shared --credential-env BRIDGE_SOL_CREDENTIAL --read
 ```
 
@@ -35,7 +43,19 @@ python -m app.domain.bridge.admin --client sol --project shared
 python -m app.domain.bridge.admin --client sol --revoke
 ```
 
-No client-facing administrative, delete, promotion, reprocessing, tag-listing or unrestricted source-fetch endpoint is exposed by the bridge.
+No client-facing administrative, delete, reprocessing, tag-listing, unrestricted source-fetch, or generic authority-update endpoint is exposed by the bridge. The only authority writes are the typed guarded operations listed above.
+
+Authority permissions are independent from ordinary memory permissions. `--propose-authority` permits creating attributed records with lifecycle `proposed`; it does not make them current. `--mutate-authority` permits explicit guarded activation, supersession, withdrawal, and dispute operations. Both default to false, and ordinary `--write` does not imply either capability.
+
+## Guarded authority workflow
+
+The authority boundary is deliberately explicit:
+
+`model suggestion → proposed record → explicit guarded mutation → authority`
+
+A proposed record is supporting material, not current authority. Every durable authority mutation requires the dedicated mutation capability, an explicit confirmation, an idempotency key, and the exact expected state digest returned by the current-authority/write result. A stale digest is rejected. A dry run previews the graph result without changing authority state or creating an authority mutation receipt. Ambiguity is returned and preserved; neither REST nor MCP silently chooses a winner.
+
+Authority write results include operation identity, affected records/edges, before/after digests and graph-derived currentness, warnings, replay state, and the durable audit identifier where applicable. Client-supplied actor identity is never accepted: the authenticated bridge client is the requesting and authorizing actor in this phase. A model-attributed proposal has no extra authority, and model provenance never bypasses the capability boundary.
 
 ## Request examples (credentials omitted)
 
@@ -83,7 +103,7 @@ Status requires read permission. It returns job states, attempts and an error-pr
 - Archive, pending job, project assignment, receipt and success audit commit together. Advisory transaction locks serialize matching idempotency scopes. Failure rolls back the submission; a separate failure audit is committed.
 - SQL echo logging is disabled to avoid logging memory content and credential digests.
 
-This is a bridge authorization boundary, not a sandbox for hostile software already running on the computer. The existing local operator UI/API and legacy MCP surface remain owner interfaces and are not converted into project-scoped clients by this patch. Give model adapters only the three bridge tools; do not give them database credentials or an unrestricted owner API adapter. Before any remote connection, only the bridge surface may be routed, with recipient/export policy and remote authentication implemented and reviewed. Existing processing `allow_external` flags are not remote retrieval grants.
+This is a bridge authorization boundary, not a sandbox for hostile software already running on the computer. The existing local operator UI/API and legacy MCP surface remain owner interfaces and are not converted into project-scoped clients by this patch. Give model adapters only the bridge tools and capabilities explicitly required for their role; do not give them database credentials or an unrestricted owner API adapter. Before any remote connection, only the bridge surface may be routed, with recipient/export policy and remote authentication implemented and reviewed. Existing processing `allow_external` flags are not remote retrieval grants.
 
 Each client retains its own personality and system instructions. Shared projects contain sources with explicit attribution; assistant assertions must not silently become human-authored evidence.
 

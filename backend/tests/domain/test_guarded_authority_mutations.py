@@ -167,7 +167,7 @@ async def test_proposal_permission_cannot_mutate_and_can_write_is_not_authority(
         idempotency_key="activate-denied",
         confirm=True,
     )
-    with pytest.raises(AuthorityMutationError, match="permission_denied"):
+    with pytest.raises(AuthorityMutationError, match="authority_mutation_forbidden"):
         await activate_authority_record(db_session, actor, request)
     await db_session.rollback()
     assert (await db_session.get(AuthorityRecordRow, UUID(item.id))).lifecycle_status == "proposed"
@@ -195,7 +195,7 @@ async def test_proposal_only_grant_cannot_run_any_single_record_mutation(
         idempotency_key=f"denied-{request_type.__name__}",
         confirm=True,
     )
-    with pytest.raises(AuthorityMutationError, match="permission_denied"):
+    with pytest.raises(AuthorityMutationError, match="authority_mutation_forbidden"):
         await operation(db_session, actor, request)
 
 
@@ -212,7 +212,7 @@ async def test_proposal_only_grant_cannot_supersede(db_session):
         idempotency_key="denied-supersede",
         confirm=True,
     )
-    with pytest.raises(AuthorityMutationError, match="permission_denied"):
+    with pytest.raises(AuthorityMutationError, match="authority_mutation_forbidden"):
         await supersede_authority_record(db_session, actor, request)
 
 
@@ -466,7 +466,7 @@ async def test_explicit_activation_may_preserve_ambiguity(db_session):
 @pytest.mark.asyncio
 async def test_model_provenance_without_capability_cannot_propose(db_session):
     actor = await grant(db_session)
-    with pytest.raises(AuthorityMutationError, match="permission_denied"):
+    with pytest.raises(AuthorityMutationError, match="authority_proposal_forbidden"):
         await create_authority_proposal(
             db_session,
             actor,

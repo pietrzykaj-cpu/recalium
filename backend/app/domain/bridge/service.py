@@ -1,17 +1,40 @@
-"""Three memory operations with authenticated, server-resolved space access."""
+"""Authenticated bridge operations with server-resolved space access."""
 
 import hashlib
 import json
-from datetime import datetime, timezone
 from dataclasses import asdict
+from datetime import UTC, datetime
 
 from sqlalchemy import select, text
 
+from app.domain.agent_succession.contracts import AttributedRecord
+from app.domain.agent_succession.service import (
+    build_agent_succession_envelope,
+    render_agent_succession_context,
+)
 from app.domain.archive.models import RawArchiveItem
 from app.domain.audit.models import AuditEvent
+from app.domain.authority.mutation_contracts import AuthorityActorContext, AuthorityScope
+from app.domain.authority.mutations import (
+    AuthorityMutationError,
+    activate_authority_record,
+    authority_state_digest,
+    create_authority_proposal,
+    mark_authority_disputed,
+    supersede_authority_record,
+    withdraw_authority_record,
+)
+from app.domain.authority.repository import evaluate_scope, list_scope_edges, list_scope_records
+from app.domain.authority.service import AuthorityValidationError
 from app.domain.bridge.access import permitted_spaces
-from app.domain.authority.repository import evaluate_scope
-from app.domain.bridge.contracts import ContextPacketInput, ContinuityHandoffInput, CurrentAuthorityInput, IngestInput, RetrieveInput, StatusInput
+from app.domain.bridge.contracts import (
+    ContextPacketInput,
+    ContinuityHandoffInput,
+    CurrentAuthorityInput,
+    IngestInput,
+    RetrieveInput,
+    StatusInput,
+)
 from app.domain.bridge.models import (
     BridgeAliasReceipt,
     BridgeArchive,
@@ -22,8 +45,6 @@ from app.domain.bridge.models import (
 from app.domain.canonical_memory.models import CanonicalMemoryItem
 from app.domain.context_packets.contracts import ContextPacket
 from app.domain.context_packets.service import build_context_packet
-from app.domain.agent_succession.contracts import AttributedRecord
-from app.domain.agent_succession.service import build_agent_succession_envelope, render_agent_succession_context
 from app.domain.derived_memory.models import Fact, Summary
 from app.domain.ingest.service import ingest_text_content
 from app.domain.jobs.models import Job
@@ -41,6 +62,46 @@ class BridgeError(Exception):
     def __init__(self, status, code):
         self.status, self.code = status, code
         super().__init__(code)
+
+
+AUTHORITY_WRITE_HANDLERS = {
+    "create_authority_proposal": create_authority_proposal,
+    "activate_authority_record": activate_authority_record,
+    "supersede_authority_record": supersede_authority_record,
+    "withdraw_authority_record": withdraw_authority_record,
+    "mark_authority_disputed": mark_authority_disputed,
+}
+
+
+def _authority_error(error: AuthorityMutationError) -> BridgeError:
+    status = {
+        "authentication_required": 401,
+        "permission_denied": 403,
+        "authority_proposal_forbidden": 403,
+        "authority_mutation_forbidden": 403,
+        "unknown_authority_record": 404,
+        "confirmation_required": 409,
+        "stale_authority_state": 409,
+        "idempotency_conflict": 409,
+        "postcondition_failed": 409,
+        "unknown_authority_operation": 400,
+    }.get(error.code, 409)
+    return BridgeError(status, error.code)
+
+
+def _authority_validation_error(error: AuthorityValidationError) -> BridgeError:
+    message = str(error).lower()
+    if "unknown authority record" in message or "both supersession records" in message:
+        return BridgeError(404, "unknown_authority_record")
+    if "one authority scope" in message:
+        return BridgeError(409, "authority_scope_mismatch")
+    if "cannot supersede itself" in message:
+        return BridgeError(409, "invalid_supersession")
+    if "duplicate supersession" in message:
+        return BridgeError(409, "duplicate_supersession_edge")
+    if "cycle" in message:
+        return BridgeError(409, "supersession_cycle")
+    return BridgeError(409, "invalid_authority_transition")
 
 
 def digest(value):
@@ -126,6 +187,20 @@ async def execute(session, authorization, operation, request):
                     )
                 )
             response["memory_space"] = _space_label(space)
+        elif operation in AUTHORITY_WRITE_HANDLERS:
+            destination = request.scope.space_id
+            resolved = [destination]
+            authority_actor = AuthorityActorContext(
+                requesting_client_id=actor,
+                authorizing_client_id=actor,
+            )
+            response = (
+                await AUTHORITY_WRITE_HANDLERS[operation](
+                    session,
+                    authority_actor,
+                    request,
+                )
+            ).model_dump(mode="json")
         else:
             requested = (
                 [request.space_id]
@@ -166,18 +241,39 @@ async def execute(session, authorization, operation, request):
             resolved_destination=destination,
             result_count=len(response.get("items", response.get("selected", []))),
             replay=response.get("idempotent_replay", False),
+            dry_run=response.get("outcome") == "preview",
+            authority_outcome=response.get("outcome"),
         )
         await session.commit()
         return response
+    except AuthorityMutationError as exc:
+        mapped = _authority_error(exc)
+        await session.rollback()
+        audit(session, actor, operation, None, "denied", code=mapped.code)
+        await session.commit()
+        raise mapped from None
+    except AuthorityValidationError as exc:
+        mapped = _authority_validation_error(exc)
+        await session.rollback()
+        audit(session, actor, operation, None, "denied", code=mapped.code)
+        await session.commit()
+        raise mapped from None
     except BridgeError as exc:
         await session.rollback()
         audit(session, actor, operation, None, "denied", code=exc.code)
         await session.commit()
         raise
-    except Exception:
+    except Exception as exc:
         await session.rollback()
-        audit(session, actor, operation, None, "error")
+        code = (
+            "authority_persistence_failure"
+            if operation in AUTHORITY_WRITE_HANDLERS
+            else None
+        )
+        audit(session, actor, operation, None, "error", code=code)
         await session.commit()
+        if code:
+            raise BridgeError(500, code) from exc
         raise
 
 
@@ -314,6 +410,18 @@ def _authority_record_payload(record, *, include_provenance):
 async def _current_authority(session, req: CurrentAuthorityInput, spaces):
     if req.space_id not in spaces:
         raise BridgeError(403, "permission_denied")
+    scope = AuthorityScope(
+        space_id=req.space_id,
+        workstream_id=req.workstream_id,
+        authority_key=req.authority_key,
+    )
+    records = await list_scope_records(
+        session,
+        space_id=req.space_id,
+        workstream_id=req.workstream_id,
+        authority_key=req.authority_key,
+    )
+    edges = await list_scope_edges(session, record_ids=[record.id for record in records])
     result = await evaluate_scope(
         session,
         space_id=req.space_id,
@@ -338,6 +446,7 @@ async def _current_authority(session, req: CurrentAuthorityInput, spaces):
             if req.include_historical else []
         ),
         "superseded_record_ids": result.superseded_record_ids if req.include_historical else [],
+        "state_digest": authority_state_digest(records, edges, scope=scope),
         "deterministic": {"currentness": "graph_derived", "source": "persisted_authority_records"},
     }
 
@@ -361,10 +470,10 @@ def _snapshot_time(authority_results):
                 value = record.get("created_at")
                 if value:
                     try:
-                        values.append(datetime.fromisoformat(value.replace("Z", "+00:00")))
+                        values.append(datetime.fromisoformat(value))
                     except (TypeError, ValueError):
                         pass
-    return max(values, default=datetime(1970, 1, 1, tzinfo=timezone.utc))
+    return max(values, default=datetime(1970, 1, 1, tzinfo=UTC))
 
 
 def _authority_decisions(authority_results, *, include_historical):

@@ -422,7 +422,7 @@ async def test_transaction_failure_does_not_leave_archive(
 
 
 @pytest.mark.asyncio
-async def test_catalog_only_three_tools():
+async def test_catalog_has_explicit_memory_authority_read_and_write_tools():
     from app.api.bridge import bridge_mcp
 
     tools = await bridge_mcp.list_tools()
@@ -433,9 +433,24 @@ async def test_catalog_only_three_tools():
         "get_ingest_status",
         "get_current_authority",
         "build_continuity_handoff",
+        "create_authority_proposal",
+        "activate_authority_record",
+        "supersede_authority_record",
+        "withdraw_authority_record",
+        "mark_authority_disputed",
     }
     for tool in tools:
-        assert tool.annotations.readOnlyHint == (tool.name != "ingest_memory")
+        assert tool.annotations.readOnlyHint == (
+            tool.name
+            not in {
+                "ingest_memory",
+                "create_authority_proposal",
+                "activate_authority_record",
+                "supersede_authority_record",
+                "withdraw_authority_record",
+                "mark_authority_disputed",
+            }
+        )
         assert tool.inputSchema["properties"].keys() == {"data"}
 
 

@@ -207,7 +207,6 @@ async def _authorize(
     ).scalar_one_or_none()
     if principal is None:
         raise AuthorityMutationError("authentication_required")
-    permission = getattr(BridgeGrant, capability)
     grant = (
         await session.execute(
             select(BridgeGrant)
@@ -215,7 +214,6 @@ async def _authorize(
             .where(
                 BridgeGrant.client_id == actor.authorizing_client_id,
                 BridgeGrant.project_id == scope.space_id,
-                permission.is_(True),
                 or_(
                     BridgeProject.kind == "shared",
                     BridgeProject.owner_client_id == actor.authorizing_client_id,
@@ -226,6 +224,13 @@ async def _authorize(
     ).scalar_one_or_none()
     if grant is None:
         raise AuthorityMutationError("permission_denied")
+    if not getattr(grant, capability):
+        code = (
+            "authority_proposal_forbidden"
+            if capability == "can_propose_authority"
+            else "authority_mutation_forbidden"
+        )
+        raise AuthorityMutationError(code)
 
 
 def _payload_digest(operation: str, actor: AuthorityActorContext, request: Any) -> str:

@@ -11,7 +11,21 @@ from mcp.types import ToolAnnotations
 from sqlalchemy import select
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.domain.bridge.contracts import ContextPacketInput, ContinuityHandoffInput, CurrentAuthorityInput, IngestInput, RetrieveInput, StatusInput
+from app.domain.authority.mutation_contracts import (
+    ActivateAuthorityRecord,
+    CreateAuthorityProposal,
+    MarkAuthorityDisputed,
+    SupersedeAuthorityRecord,
+    WithdrawAuthorityRecord,
+)
+from app.domain.bridge.contracts import (
+    ContextPacketInput,
+    ContinuityHandoffInput,
+    CurrentAuthorityInput,
+    IngestInput,
+    RetrieveInput,
+    StatusInput,
+)
 from app.domain.bridge.models import BridgeClient
 from app.domain.bridge.service import BridgeError, audit, digest, execute
 from app.infrastructure.db import get_session_factory
@@ -120,6 +134,31 @@ async def current_authority_route(data: CurrentAuthorityInput, request: Request)
     return await call(request.headers.get("authorization"), "get_current_authority", data)
 
 
+@bridge_app.post("/v1/create_authority_proposal")
+async def create_authority_proposal_route(data: CreateAuthorityProposal, request: Request):
+    return await call(request.headers.get("authorization"), "create_authority_proposal", data)
+
+
+@bridge_app.post("/v1/activate_authority_record")
+async def activate_authority_record_route(data: ActivateAuthorityRecord, request: Request):
+    return await call(request.headers.get("authorization"), "activate_authority_record", data)
+
+
+@bridge_app.post("/v1/supersede_authority_record")
+async def supersede_authority_record_route(data: SupersedeAuthorityRecord, request: Request):
+    return await call(request.headers.get("authorization"), "supersede_authority_record", data)
+
+
+@bridge_app.post("/v1/withdraw_authority_record")
+async def withdraw_authority_record_route(data: WithdrawAuthorityRecord, request: Request):
+    return await call(request.headers.get("authorization"), "withdraw_authority_record", data)
+
+
+@bridge_app.post("/v1/mark_authority_disputed")
+async def mark_authority_disputed_route(data: MarkAuthorityDisputed, request: Request):
+    return await call(request.headers.get("authorization"), "mark_authority_disputed", data)
+
+
 @bridge_app.post("/v1/build_continuity_handoff")
 async def continuity_handoff_route(data: ContinuityHandoffInput, request: Request):
     return await call(request.headers.get("authorization"), "build_continuity_handoff", data)
@@ -167,6 +206,71 @@ async def build_context_packet(data: ContextPacketInput, ctx: Context) -> dict:
 async def get_current_authority(data: CurrentAuthorityInput, ctx: Context) -> dict:
     """Read persisted graph-derived current authority for one authorized scope; ambiguity is returned, never resolved by guessing."""
     return await mcp_call(ctx, "get_current_authority", data)
+
+
+@bridge_mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+async def create_authority_proposal(data: CreateAuthorityProposal, ctx: Context) -> dict:
+    """Create attributed proposed authority only; this never makes a record authoritative."""
+    return await mcp_call(ctx, "create_authority_proposal", data)
+
+
+@bridge_mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+async def activate_authority_record(data: ActivateAuthorityRecord, ctx: Context) -> dict:
+    """Explicitly activate a proposal with mutation capability, confirmation, and the expected state digest; ambiguity is preserved."""
+    return await mcp_call(ctx, "activate_authority_record", data)
+
+
+@bridge_mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+async def supersede_authority_record(data: SupersedeAuthorityRecord, ctx: Context) -> dict:
+    """Explicitly replace one authority record with another; capability, confirmation, and an expected state digest are mandatory."""
+    return await mcp_call(ctx, "supersede_authority_record", data)
+
+
+@bridge_mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+async def withdraw_authority_record(data: WithdrawAuthorityRecord, ctx: Context) -> dict:
+    """Explicitly withdraw an authority record without reviving superseded predecessors; guarded mutation inputs are mandatory."""
+    return await mcp_call(ctx, "withdraw_authority_record", data)
+
+
+@bridge_mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+)
+async def mark_authority_disputed(data: MarkAuthorityDisputed, ctx: Context) -> dict:
+    """Explicitly mark authority disputed without selecting a winner; guarded mutation inputs are mandatory."""
+    return await mcp_call(ctx, "mark_authority_disputed", data)
 
 
 
