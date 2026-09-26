@@ -27,6 +27,7 @@ from app.domain.agent_succession.service import build_agent_succession_envelope,
 from app.domain.derived_memory.models import Fact, Summary
 from app.domain.ingest.service import ingest_text_content
 from app.domain.jobs.models import Job
+from app.domain.retrieval.diagnostics import RetrievalDiagnostics
 from app.domain.retrieval.service import (
     RetrievalFilters,
     RetrievalItem,
@@ -443,12 +444,16 @@ async def _continuity_handoff(session, actor, req: ContinuityHandoffInput, space
         spaces,
         generated_at=_snapshot_time(authority_results),
     )
+    diagnostics_payload = packet_payload.pop("retrieval_diagnostics", None)
+    if diagnostics_payload is not None:
+        diagnostics_payload["generated_at"] = _snapshot_time(authority_results).isoformat()
     packet = ContextPacket.model_validate(packet_payload)
     envelope = build_agent_succession_envelope(
         packet,
         current_agent=req.current_agent,
         predecessors=req.predecessors,
         decisions=_authority_decisions(authority_results, include_historical=req.include_historical),
+        diagnostics=(RetrievalDiagnostics.model_validate(diagnostics_payload) if diagnostics_payload is not None else None),
         generated_at=packet.generated_at,
     )
     base_budget = max(200, req.render_max_chars - 1200)
@@ -494,6 +499,7 @@ async def _continuity_handoff(session, actor, req: ContinuityHandoffInput, space
         "excluded_memory_ids": [item.memory_id for item in packet.excluded],
         "unresolved_questions": list(packet.unresolved_questions),
         "flags": list(packet.flags),
+        "retrieval_diagnostics": diagnostics_payload,
         "provenance": provenance,
         "packet_integrity": packet.integrity.model_dump(mode="json"),
         "predecessors": [item.model_dump(mode="json") for item in req.predecessors],

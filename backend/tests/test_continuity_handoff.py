@@ -11,6 +11,7 @@ from app.api import bridge as bridge_module
 from app.domain.bridge.contracts import ContinuityHandoffInput
 from app.domain.bridge.models import BridgeClient, BridgeGrant, BridgeProject
 from app.domain.context_packets.service import build_context_packet
+from app.domain.retrieval.diagnostics import RetrievalDiagnostics
 from app.domain.retrieval.service import RetrievalItem, RetrievalResponse
 
 
@@ -181,3 +182,24 @@ async def test_rest_and_mcp_empty_authority_handoff_are_equivalent(client, ident
     assert body["included_memory_ids"] == []
     assert "authority_empty:missing" in body["warnings"]
     assert body["succession_envelope"]["current_agent"]["inherited_evidence_is_not_personal_memory"] is True
+@pytest.mark.asyncio
+async def test_handoff_preserves_opt_in_diagnostics(monkeypatch):
+    async def fake_authority(session, request, spaces):
+        return authority(request.authority_key)
+
+    async def fake_packet(session, actor, request, spaces, generated_at=None):
+        payload = packet_payload()
+        payload["retrieval_diagnostics"] = RetrievalDiagnostics(
+            generated_at=NOW, mode=request.mode, memory_space_ids=["shared"],
+        ).model_dump(mode="json")
+        return payload
+
+    monkeypatch.setattr(bridge_service, "_current_authority", fake_authority)
+    monkeypatch.setattr(bridge_service, "_context_packet", fake_packet)
+    request = ContinuityHandoffInput(
+        space_id="shared", workstream_id="bootstrap",
+        authority_keys=["state"], query="continuity", include_diagnostics=True,
+    )
+    result = await bridge_service._continuity_handoff(None, "reader", request, {"shared": object()})
+    assert result["retrieval_diagnostics"]["version"] == "retrieval-diagnostics-v1"
+    assert result["succession_envelope"]["inherited"]["retrieval_diagnostics"]["memory_space_ids"] == ["shared"]
