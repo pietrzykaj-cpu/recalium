@@ -27,6 +27,7 @@ def main() -> int:
         args.output.write_text(
             json.dumps(schema, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
+            newline="\n",
         )
     except Exception as exc:
         parser.error(f"could not build OpenAPI schema: {exc}")

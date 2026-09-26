@@ -50,6 +50,9 @@ def test_exporter_matches_runtime_schema(tmp_path: Path) -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
+    exported_bytes = output.read_bytes()
+    assert b"\r\n" not in exported_bytes
+    assert b"\n" in exported_bytes
     exported = json.loads(output.read_text(encoding="utf-8"))
     assert json.dumps(exported, sort_keys=True, separators=(",", ":")) == json.dumps(
         _schema(), sort_keys=True, separators=(",", ":")
