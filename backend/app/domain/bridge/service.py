@@ -9,7 +9,8 @@ from sqlalchemy import select, text
 from app.domain.archive.models import RawArchiveItem
 from app.domain.audit.models import AuditEvent
 from app.domain.bridge.access import permitted_spaces
-from app.domain.bridge.contracts import ContextPacketInput, IngestInput, RetrieveInput, StatusInput
+from app.domain.authority.repository import evaluate_scope
+from app.domain.bridge.contracts import ContextPacketInput, CurrentAuthorityInput, IngestInput, RetrieveInput, StatusInput
 from app.domain.bridge.models import (
     BridgeAliasReceipt,
     BridgeArchive,
@@ -122,9 +123,13 @@ async def execute(session, authorization, operation, request):
             response["memory_space"] = _space_label(space)
         else:
             requested = (
-                [request.project_id]
-                if request.project_id is not None
-                else getattr(request, "space_ids", None)
+                [request.space_id]
+                if operation == "get_current_authority"
+                else (
+                    [request.project_id]
+                    if request.project_id is not None
+                    else getattr(request, "space_ids", None)
+                )
             )
             spaces = await permitted_spaces(session, actor, requested)
             if requested is not None and not set(requested).issubset(spaces):
@@ -136,13 +141,15 @@ async def execute(session, authorization, operation, request):
                 response = await _context_packet(session, actor, request, spaces)
             elif operation == "get_ingest_status":
                 response = await _status(session, request, spaces)
+            elif operation == "get_current_authority":
+                response = await _current_authority(session, request, spaces)
             else:
                 raise BridgeError(400, "unknown_operation")
         audit(
             session,
             actor,
             operation,
-            destination or request.project_id,
+            destination or getattr(request, "project_id", None) or getattr(request, "space_id", None),
             "allowed",
             searched_space_ids=(
                 resolved
@@ -287,6 +294,45 @@ async def _processing(session, item):
             raise BridgeError(403, "source_scope_violation")
         processing = {"method": summary.derivation_method, "model": summary.model_used}
     return processing
+
+
+
+def _authority_record_payload(record, *, include_provenance):
+    payload = record.model_dump(mode="json")
+    if not include_provenance:
+        payload.pop("provenance", None)
+    return payload
+
+
+async def _current_authority(session, req: CurrentAuthorityInput, spaces):
+    if req.space_id not in spaces:
+        raise BridgeError(403, "permission_denied")
+    result = await evaluate_scope(
+        session,
+        space_id=req.space_id,
+        workstream_id=req.workstream_id,
+        authority_key=req.authority_key,
+    )
+    return {
+        "status": result.status,
+        "space_id": result.space_id,
+        "workstream_id": result.workstream_id,
+        "authority_key": result.authority_key,
+        "current_record": (
+            _authority_record_payload(result.current_record, include_provenance=req.include_provenance)
+            if result.current_record is not None else None
+        ),
+        "competing_records": (
+            [_authority_record_payload(r, include_provenance=req.include_provenance) for r in result.competing_records]
+            if req.include_competing else []
+        ),
+        "historical_records": (
+            [_authority_record_payload(r, include_provenance=req.include_provenance) for r in result.historical_records]
+            if req.include_historical else []
+        ),
+        "superseded_record_ids": result.superseded_record_ids if req.include_historical else [],
+        "deterministic": {"currentness": "graph_derived", "source": "persisted_authority_records"},
+    }
 
 
 async def _retrieve(session, actor, req: RetrieveInput, spaces, diagnostics=None):

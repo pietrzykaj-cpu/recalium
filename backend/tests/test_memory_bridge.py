@@ -431,6 +431,7 @@ async def test_catalog_only_three_tools():
         "build_context_packet",
         "ingest_memory",
         "get_ingest_status",
+        "get_current_authority",
     }
     for tool in tools:
         assert tool.annotations.readOnlyHint == (tool.name != "ingest_memory")

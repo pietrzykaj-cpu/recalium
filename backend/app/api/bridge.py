@@ -11,7 +11,7 @@ from mcp.types import ToolAnnotations
 from sqlalchemy import select
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.domain.bridge.contracts import ContextPacketInput, IngestInput, RetrieveInput, StatusInput
+from app.domain.bridge.contracts import ContextPacketInput, CurrentAuthorityInput, IngestInput, RetrieveInput, StatusInput
 from app.domain.bridge.models import BridgeClient
 from app.domain.bridge.service import BridgeError, audit, digest, execute
 from app.infrastructure.db import get_session_factory
@@ -114,6 +114,12 @@ async def status_route(data: StatusInput, request: Request):
     return await call(request.headers.get("authorization"), "get_ingest_status", data)
 
 
+
+@bridge_app.post("/v1/get_current_authority")
+async def current_authority_route(data: CurrentAuthorityInput, request: Request):
+    return await call(request.headers.get("authorization"), "get_current_authority", data)
+
+
 @bridge_app.post("/v1/build_context_packet")
 async def context_packet_route(data: ContextPacketInput, request: Request):
     return await call(request.headers.get("authorization"), "build_context_packet", data)
@@ -142,6 +148,15 @@ async def retrieve_memory(data: RetrieveInput, ctx: Context) -> dict:
 async def build_context_packet(data: ContextPacketInput, ctx: Context) -> dict:
     """Build a transient packet of attributed evidence; never persist it as personal memory."""
     return await mcp_call(ctx, "build_context_packet", data)
+
+
+@bridge_mcp.tool(
+    annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False)
+)
+async def get_current_authority(data: CurrentAuthorityInput, ctx: Context) -> dict:
+    """Read persisted graph-derived current authority for one authorized scope; ambiguity is returned, never resolved by guessing."""
+    return await mcp_call(ctx, "get_current_authority", data)
+
 
 
 @bridge_mcp.tool(

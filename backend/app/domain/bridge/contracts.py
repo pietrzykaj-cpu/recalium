@@ -63,3 +63,14 @@ class ContextPacketInput(RetrieveInput):
 class StatusInput(StrictInput):
     project_id: ProjectId | None = None
     archive_id: UUID
+
+
+class CurrentAuthorityInput(StrictInput):
+    """Read-only query for one persisted authority scope."""
+
+    space_id: ProjectId
+    workstream_id: str = Field(min_length=1, max_length=128)
+    authority_key: str = Field(min_length=1, max_length=255)
+    include_historical: bool = False
+    include_provenance: bool = False
+    include_competing: bool = True
