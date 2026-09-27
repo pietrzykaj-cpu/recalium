@@ -190,6 +190,22 @@ Filed upstream as
 (combined with the "merge on CI alone" entry above — same mandate, same
 missing threshold).
 
+**Update (2026-09-27) — repository-local fallback proposed:** PR #1 later
+reproduced the unresolved case in a fork with no available automated reviewer
+or review check. The implementation needed an actual diff review, a corrective
+commit, updated certification, and a one-off maintainer exception before merge;
+the managed instruction still supplied no durable path for future PRs. A paid
+reviewer was unnecessary for the project's needs, while the evaluated third-party
+review app requested fixed repository-code and workflow write permissions broader
+than a review-only gate required. The proposed local policy in `AGENTS.md` keeps
+configured automated review as the preferred path and adds a provider-neutral
+fallback: verify and record the absence, conduct and record a distinct review of
+the complete diff, address material findings, rerun relevant certification, and
+obtain explicit maintainer authorization. It also preserves the distinction
+between a completed merge and post-merge verification that actually ran. This is
+a local resolution linked to existing issue #77, not a claim that the upstream
+agentharness default has changed.
+
 ---
 
 ## 2026-07-17: Request — a built-in, optional "harness feedback" mechanism

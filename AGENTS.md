@@ -40,6 +40,39 @@ Read `agents/project.instructions.md` for current repository-specific implementa
 ## Commit & Pull Request Guidelines
 Current history uses conventional-style subjects such as `chore: initial commit`; keep that format with a lowercase type and imperative summary (`docs: update architecture handoff links`). PRs should state which package changed (`requirements`, `architecture`, `plans`, `operational`, or `agents`), summarize cross-file impacts, and list validation performed. When a change updates the documented process, link the source document that remains canonical after the PR.
 
+### Review completion when automation is unavailable
+
+The automated review or completed review check required by the managed checklist
+below is the preferred path. When such a reviewer is configured and available,
+wait for it to complete, inspect both issue-level and inline findings, and address
+every material finding before merge. Green tests or CI do not replace review.
+
+If no automated GitHub reviewer or review check can actually be requested for the
+repository and pull request, prevent deadlock with this fallback:
+
+1. Verify and record the absence on the pull request or another durable record
+   linked from it. A reviewer that is merely pending, failed, or temporarily
+   unreachable is not silently treated as absent; record that condition and get a
+   maintainer decision before using the fallback.
+2. After implementation stops, perform a distinct review pass over the complete
+   PR diff. Review correctness, security and safety, regression risk, tests, scope,
+   and every certification claim. Use a separate reviewer, agent, model, or task
+   context when one is available. Otherwise, clearly separate the review pass from
+   implementation, approach it as a reviewer who may request changes, and record
+   its findings separately from the implementation report. Do not claim stronger
+   human or organizational independence than the review actually had.
+3. Address every material finding and rerun the relevant certification after any
+   correction. Record the review result and finding dispositions on the pull
+   request or its linked durable record.
+4. Obtain explicit maintainer authorization before merge.
+
+This fallback never permits relying only on the PR description, green CI, or the
+implementation pass's own summary; it is not silent self-approval and must not be
+represented as a GitHub approval by the PR author. After merge, preserve the
+distinction between `merged` and `verified green`: observe required post-merge
+checks to a terminal state when available. If post-merge CI is unavailable, say
+that it did not run and do not claim green verification.
+
 <!-- agentharness:begin id=core-instructions version=0.3.0 -->
 This project uses [agentharness](https://github.com/andr-ca/agentharness)
 for engineering policies (git conventions, testing, review workflow).
