@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import json
 from types import SimpleNamespace
+from typing import Any, Self
 from unittest.mock import AsyncMock
 
 import httpx
@@ -88,6 +89,7 @@ async def test_certified_request_is_preserved_with_bounded_native_options() -> N
     assert result.content == "Final answer."
     assert result.reasoning_present is False
     assert result.http_status == 200
+    assert result.elapsed_ms is not None
     assert result.elapsed_ms >= 0
     assert result.persisted is False
     assert result.inherited_context_was_attributed is True
@@ -146,21 +148,29 @@ async def test_blank_approved_model_is_rejected_before_transport() -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_disables_proxy_inheritance_and_redirects(monkeypatch) -> None:
+async def test_client_disables_proxy_inheritance_and_redirects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     captured_kwargs: dict[str, object] = {}
 
     class FakeClient:
-        async def __aenter__(self):
+        async def __aenter__(self) -> Self:
             return self
 
-        async def __aexit__(self, *args):
+        async def __aexit__(self, *args: object) -> bool:
             return False
 
-        async def post(self, url, *, json, headers=None):
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict[str, Any],
+            headers: dict[str, str] | None = None,
+        ) -> httpx.Response:
             request = httpx.Request("POST", url)
             return json_response(request)
 
-    def client_factory(**kwargs):
+    def client_factory(**kwargs: object) -> FakeClient:
         captured_kwargs.update(kwargs)
         return FakeClient()
 
@@ -237,8 +247,16 @@ async def test_transport_failures_are_deterministic_and_not_retried(
 
 
 @pytest.mark.asyncio
-async def test_overall_timeout_is_bounded_and_not_retried() -> None:
+async def test_overall_timeout_is_bounded_and_not_retried(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls = 0
+
+    real_timeout = asyncio.timeout
+    monkeypatch.setattr(
+        "app.domain.model_context.execution.asyncio.timeout",
+        lambda _certified_seconds: real_timeout(0.01),
+    )
 
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
@@ -252,7 +270,6 @@ async def test_overall_timeout_is_bounded_and_not_retried() -> None:
             request=provider_request(),
             approved_model="qwen3:4b",
             transport=httpx.MockTransport(handler),
-            timeouts=OllamaExecutionTimeouts(overall_seconds=0.01),
         )
     assert calls == 1
 
@@ -388,12 +405,56 @@ def test_execution_boundary_has_no_db_tool_memory_or_authority_dependencies() ->
     assert not any(dependency in source for dependency in forbidden_dependencies)
 
 
-def test_options_and_timeouts_reject_unbounded_values() -> None:
-    with pytest.raises(ValueError):
-        OllamaContinuityOptions(num_ctx=0)
-    with pytest.raises(ValueError):
-        OllamaContinuityOptions(num_predict=0)
-    with pytest.raises(ValueError):
-        OllamaExecutionTimeouts(connect_seconds=0)
-    with pytest.raises(ValueError):
-        OllamaExecutionTimeouts(overall_seconds=0)
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", float("nan")),
+        ("temperature", float("inf")),
+        ("temperature", float("-inf")),
+        ("temperature", 0.1),
+        ("seed", 1),
+        ("num_ctx", 0),
+        ("num_ctx", 4097),
+        ("num_predict", 0),
+        ("num_predict", 257),
+        ("keep_alive", "5m"),
+        ("think", True),
+    ],
+)
+def test_generation_controls_reject_noncertified_overrides(
+    field: str,
+    value: object,
+) -> None:
+    overrides: Any = {field: value}
+    with pytest.raises(ValueError, match="certified"):
+        OllamaContinuityOptions(**overrides)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("connect_seconds", float("nan")),
+        ("connect_seconds", float("inf")),
+        ("connect_seconds", float("-inf")),
+        ("connect_seconds", 0),
+        ("connect_seconds", -1),
+        ("connect_seconds", 5.01),
+        ("read_seconds", 60.01),
+        ("write_seconds", 10.01),
+        ("pool_seconds", 5.01),
+        ("overall_seconds", 0),
+        ("overall_seconds", -1),
+        ("overall_seconds", 75.01),
+    ],
+)
+def test_timeouts_reject_noncertified_overrides(field: str, value: object) -> None:
+    overrides: Any = {field: value}
+    with pytest.raises(ValueError, match="certified"):
+        OllamaExecutionTimeouts(**overrides)
+
+
+def test_certified_executor_exposes_no_control_override_parameters() -> None:
+    parameters = inspect.signature(execute_local_ollama_provider_request).parameters
+
+    assert "options" not in parameters
+    assert "timeouts" not in parameters

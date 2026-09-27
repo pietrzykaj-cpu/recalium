@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from math import isfinite
 from time import perf_counter
 from typing import Literal, Protocol
 
@@ -45,7 +46,7 @@ class ModelExecutionResult(ModelContextModel):
 
 @dataclass(frozen=True)
 class OllamaExecutionTimeouts:
-    """Bounded transport and overall limits for a one-shot local request."""
+    """Fixed transport and watchdog limits for a one-shot local request."""
 
     connect_seconds: float = 5.0
     read_seconds: float = 60.0
@@ -54,15 +55,23 @@ class OllamaExecutionTimeouts:
     overall_seconds: float = 75.0
 
     def __post_init__(self) -> None:
-        for name, value in (
-            ("connect_seconds", self.connect_seconds),
-            ("read_seconds", self.read_seconds),
-            ("write_seconds", self.write_seconds),
-            ("pool_seconds", self.pool_seconds),
-            ("overall_seconds", self.overall_seconds),
+        for name, value, certified_value in (
+            ("connect_seconds", self.connect_seconds, 5.0),
+            ("read_seconds", self.read_seconds, 60.0),
+            ("write_seconds", self.write_seconds, 10.0),
+            ("pool_seconds", self.pool_seconds, 5.0),
+            ("overall_seconds", self.overall_seconds, 75.0),
         ):
-            if value <= 0:
-                raise ValueError(f"Ollama {name} must be positive")
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not isfinite(float(value))
+                or float(value) != certified_value
+            ):
+                raise ValueError(
+                    f"Ollama {name} must remain at the certified value "
+                    f"{certified_value:g}"
+                )
 
 
 def _ollama_headers(settings: OllamaExecutionSettingsLike) -> dict[str, str] | None:
@@ -82,8 +91,6 @@ async def execute_local_ollama_provider_request(
     settings: OllamaExecutionSettingsLike,
     request: ProviderChatRequest,
     approved_model: str,
-    options: OllamaContinuityOptions | None = None,
-    timeouts: OllamaExecutionTimeouts | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> ModelExecutionResult:
     """Execute one certified provider request through a local-only Ollama boundary.
@@ -104,8 +111,8 @@ async def execute_local_ollama_provider_request(
     if request.model != expected_model:
         raise ValueError("The provider request model does not match the approved model")
 
-    selected_options = options or OllamaContinuityOptions()
-    selected_timeouts = timeouts or OllamaExecutionTimeouts()
+    selected_options = OllamaContinuityOptions()
+    selected_timeouts = OllamaExecutionTimeouts()
     timeout = httpx.Timeout(
         connect=selected_timeouts.connect_seconds,
         read=selected_timeouts.read_seconds,

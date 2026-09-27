@@ -5,6 +5,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from math import isfinite
 from typing import Any, Protocol
 
 from app.domain.agent_succession.contracts import RenderedSuccessionContext
@@ -27,7 +28,7 @@ class OllamaSettingsLike(Protocol):
 
 @dataclass(frozen=True)
 class OllamaContinuityOptions:
-    """Deterministic, bounded options for one continuity-consumption request."""
+    """Fixed deterministic options for the certified continuity executor."""
 
     temperature: float = 0
     seed: int = 20260915
@@ -37,12 +38,23 @@ class OllamaContinuityOptions:
     think: bool = False
 
     def __post_init__(self) -> None:
-        if self.num_ctx <= 0:
-            raise ValueError("Ollama num_ctx must be positive")
-        if self.num_predict <= 0:
-            raise ValueError("Ollama num_predict must be positive")
-        if not self.keep_alive.strip():
-            raise ValueError("Ollama keep_alive must not be blank")
+        if (
+            isinstance(self.temperature, bool)
+            or not isinstance(self.temperature, (int, float))
+            or not isfinite(float(self.temperature))
+            or float(self.temperature) != 0.0
+        ):
+            raise ValueError("Ollama temperature must remain at the certified value 0")
+        if type(self.seed) is not int or self.seed != 20260915:
+            raise ValueError("Ollama seed must remain at the certified value 20260915")
+        if type(self.num_ctx) is not int or self.num_ctx != 4096:
+            raise ValueError("Ollama num_ctx must remain at the certified value 4096")
+        if type(self.num_predict) is not int or self.num_predict != 256:
+            raise ValueError("Ollama num_predict must remain at the certified value 256")
+        if self.keep_alive != "0s":
+            raise ValueError("Ollama keep_alive must remain at the certified value '0s'")
+        if self.think is not False:
+            raise ValueError("Ollama think must remain at the certified value false")
 
 
 @dataclass(frozen=True)
