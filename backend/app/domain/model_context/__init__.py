@@ -4,6 +4,7 @@ from app.domain.model_context.continuity import (
     ContinuityBudgetExceeded,
     ContinuityConsumptionError,
     build_continuity_consumption_payload,
+    build_continuity_provider_request,
     canonical_consumption_json,
 )
 from app.domain.model_context.contracts import (
@@ -26,6 +27,7 @@ __all__ = [
     "ProviderChatRequest",
     "ProviderMessage",
     "build_continuity_consumption_payload",
+    "build_continuity_provider_request",
     "canonical_consumption_json",
     "execute_ollama_succession_conversation",
 ]

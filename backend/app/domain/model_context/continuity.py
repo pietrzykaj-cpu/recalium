@@ -27,6 +27,8 @@ from app.domain.model_context.contracts import (
     ContinuityDiagnostics,
     ContinuityStructuredContext,
     FullProvenanceEntry,
+    ProviderChatRequest,
+    ProviderMessage,
     RetrievalMetadataEntry,
 )
 
@@ -699,4 +701,36 @@ def build_continuity_consumption_payload(
         budget=budget,
         capabilities=capabilities,
         integrity=ConsumptionIntegrity(consumption_digest=digest),
+    )
+
+
+def build_continuity_provider_request(
+    payload: ContinuityConsumptionPayload,
+    *,
+    model: str,
+) -> ProviderChatRequest:
+    """Map certified continuity content into a provider-neutral chat request.
+
+    Phase 2B deliberately stops at request construction. The mapping copies the
+    certified system instructions and rendered context without independently
+    interpreting authority, exposing diagnostics, or granting capabilities.
+    """
+    selected_model = model.strip()
+    if not selected_model:
+        raise ValueError("A target model must be supplied by the caller")
+    if (
+        payload.capabilities.allowed_tools
+        or payload.capabilities.authority_proposal_allowed
+        or payload.capabilities.authority_mutation_allowed
+    ):
+        raise ContinuityConsumptionError(
+            "capability_violation",
+            "continuity request mapping cannot expose tools or authority-write capabilities",
+        )
+    return ProviderChatRequest(
+        model=selected_model,
+        messages=[
+            ProviderMessage(role="system", content="\n".join(payload.system_instructions)),
+            ProviderMessage(role="user", content=payload.rendered_context),
+        ],
     )
