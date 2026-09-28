@@ -49,18 +49,18 @@ class OllamaExecutionTimeouts:
     """Fixed transport and watchdog limits for a one-shot local request."""
 
     connect_seconds: float = 5.0
-    read_seconds: float = 60.0
+    read_seconds: float = 120.0
     write_seconds: float = 10.0
     pool_seconds: float = 5.0
-    overall_seconds: float = 75.0
+    overall_seconds: float = 135.0
 
     def __post_init__(self) -> None:
         for name, value, certified_value in (
             ("connect_seconds", self.connect_seconds, 5.0),
-            ("read_seconds", self.read_seconds, 60.0),
+            ("read_seconds", self.read_seconds, 120.0),
             ("write_seconds", self.write_seconds, 10.0),
             ("pool_seconds", self.pool_seconds, 5.0),
-            ("overall_seconds", self.overall_seconds, 75.0),
+            ("overall_seconds", self.overall_seconds, 135.0),
         ):
             if (
                 isinstance(value, bool)
