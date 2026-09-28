@@ -188,7 +188,7 @@ async def test_client_disables_proxy_inheritance_and_redirects(
     timeout = captured_kwargs["timeout"]
     assert isinstance(timeout, httpx.Timeout)
     assert timeout.connect == 5.0
-    assert timeout.read == 60.0
+    assert timeout.read == 120.0
     assert timeout.write == 10.0
     assert timeout.pool == 5.0
 
@@ -251,11 +251,17 @@ async def test_overall_timeout_is_bounded_and_not_retried(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = 0
+    captured_overall_seconds: list[float] = []
 
     real_timeout = asyncio.timeout
+
+    def bounded_timeout(certified_seconds: float) -> asyncio.Timeout:
+        captured_overall_seconds.append(certified_seconds)
+        return real_timeout(0.01)
+
     monkeypatch.setattr(
         "app.domain.model_context.execution.asyncio.timeout",
-        lambda _certified_seconds: real_timeout(0.01),
+        bounded_timeout,
     )
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -272,6 +278,7 @@ async def test_overall_timeout_is_bounded_and_not_retried(
             transport=httpx.MockTransport(handler),
         )
     assert calls == 1
+    assert captured_overall_seconds == [135.0]
 
 
 @pytest.mark.asyncio
@@ -439,18 +446,30 @@ def test_generation_controls_reject_noncertified_overrides(
         ("connect_seconds", 0),
         ("connect_seconds", -1),
         ("connect_seconds", 5.01),
-        ("read_seconds", 60.01),
+        ("read_seconds", 60.0),
+        ("read_seconds", 120.01),
         ("write_seconds", 10.01),
         ("pool_seconds", 5.01),
         ("overall_seconds", 0),
         ("overall_seconds", -1),
-        ("overall_seconds", 75.01),
+        ("overall_seconds", 75.0),
+        ("overall_seconds", 135.01),
     ],
 )
 def test_timeouts_reject_noncertified_overrides(field: str, value: object) -> None:
     overrides: Any = {field: value}
     with pytest.raises(ValueError, match="certified"):
         OllamaExecutionTimeouts(**overrides)
+
+
+def test_certified_timeout_values_are_fixed() -> None:
+    timeouts = OllamaExecutionTimeouts()
+
+    assert timeouts.connect_seconds == 5.0
+    assert timeouts.read_seconds == 120.0
+    assert timeouts.write_seconds == 10.0
+    assert timeouts.pool_seconds == 5.0
+    assert timeouts.overall_seconds == 135.0
 
 
 def test_certified_executor_exposes_no_control_override_parameters() -> None:
