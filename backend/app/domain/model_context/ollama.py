@@ -33,7 +33,7 @@ class OllamaContinuityOptions:
     temperature: float = 0
     seed: int = 20260915
     num_ctx: int = 4096
-    num_predict: int = 256
+    num_predict: int = 512
     keep_alive: str = "0s"
     think: bool = False
 
@@ -49,8 +49,8 @@ class OllamaContinuityOptions:
             raise ValueError("Ollama seed must remain at the certified value 20260915")
         if type(self.num_ctx) is not int or self.num_ctx != 4096:
             raise ValueError("Ollama num_ctx must remain at the certified value 4096")
-        if type(self.num_predict) is not int or self.num_predict != 256:
-            raise ValueError("Ollama num_predict must remain at the certified value 256")
+        if type(self.num_predict) is not int or self.num_predict != 512:
+            raise ValueError("Ollama num_predict must remain at the certified value 512")
         if self.keep_alive != "0s":
             raise ValueError("Ollama keep_alive must remain at the certified value '0s'")
         if self.think is not False:

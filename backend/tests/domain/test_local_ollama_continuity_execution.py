@@ -81,7 +81,7 @@ async def test_certified_request_is_preserved_with_bounded_native_options() -> N
         "temperature": 0,
         "seed": 20260915,
         "num_ctx": 4096,
-        "num_predict": 256,
+        "num_predict": 512,
     }
     assert result.provider == "ollama"
     assert result.model == original.model
@@ -423,7 +423,9 @@ def test_execution_boundary_has_no_db_tool_memory_or_authority_dependencies() ->
         ("num_ctx", 0),
         ("num_ctx", 4097),
         ("num_predict", 0),
-        ("num_predict", 257),
+        ("num_predict", 256),
+        ("num_predict", 511),
+        ("num_predict", 513),
         ("keep_alive", "5m"),
         ("think", True),
     ],
@@ -435,6 +437,17 @@ def test_generation_controls_reject_noncertified_overrides(
     overrides: Any = {field: value}
     with pytest.raises(ValueError, match="certified"):
         OllamaContinuityOptions(**overrides)
+
+
+def test_certified_generation_values_are_fixed() -> None:
+    options = OllamaContinuityOptions()
+
+    assert options.temperature == 0
+    assert options.seed == 20260915
+    assert options.num_ctx == 4096
+    assert options.num_predict == 512
+    assert options.keep_alive == "0s"
+    assert options.think is False
 
 
 @pytest.mark.parametrize(
