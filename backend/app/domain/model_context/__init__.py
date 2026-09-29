@@ -20,12 +20,19 @@ from app.domain.model_context.execution import (
     execute_ollama_succession_conversation,
 )
 from app.domain.model_context.ollama import OllamaContinuityOptions
+from app.domain.model_context.profiles import (
+    ApprovedLocalModelProfile,
+    LocalModelRole,
+    resolve_local_model_profile,
+)
 
 __all__ = [
+    "ApprovedLocalModelProfile",
     "ContextSegment",
     "ContinuityBudgetExceeded",
     "ContinuityConsumptionError",
     "ContinuityConsumptionPayload",
+    "LocalModelRole",
     "ModelExecutionResult",
     "OllamaContinuityOptions",
     "OllamaExecutionTimeouts",
@@ -36,4 +43,5 @@ __all__ = [
     "canonical_consumption_json",
     "execute_local_ollama_provider_request",
     "execute_ollama_succession_conversation",
+    "resolve_local_model_profile",
 ]

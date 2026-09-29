@@ -1,12 +1,32 @@
 """Local inference must never grant permission to a different remote operation."""
+import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
-import uuid
 
 import pytest
 
-from app.worker import dispatcher as d
 from app.domain.policy.gate import SensitivityDecision
+from app.worker import dispatcher as d
+
+
+class FakeCoordinator:
+    @asynccontextmanager
+    async def acquire(self, **_kwargs: object) -> AsyncIterator[None]:
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _clean_db_between_tests() -> None:
+    """Override the repository DB fixture for this mocked worker module."""
+
+
+@pytest.fixture(autouse=True)
+def coordinator(monkeypatch):
+    value = FakeCoordinator()
+    monkeypatch.setattr(d, "get_local_inference_coordinator", lambda: value)
+    return value
 
 
 @pytest.fixture

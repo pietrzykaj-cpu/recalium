@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any, Self
 from unittest.mock import AsyncMock
@@ -17,6 +19,34 @@ from app.domain.model_context.execution import (
     execute_local_ollama_provider_request,
 )
 from app.domain.model_context.ollama import OllamaContinuityOptions
+from app.domain.model_context.profiles import LocalModelRole
+
+
+@pytest.fixture(autouse=True)
+def _clean_db_between_tests() -> None:
+    """Override the repository DB fixture for this socket-free unit module."""
+
+
+class PassThroughCoordinator:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    @asynccontextmanager
+    async def acquire(self, **kwargs: object) -> AsyncIterator[None]:
+        self.calls.append(kwargs)
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _mock_local_inference_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> PassThroughCoordinator:
+    coordinator = PassThroughCoordinator()
+    monkeypatch.setattr(
+        "app.domain.model_context.execution.get_local_inference_coordinator",
+        lambda: coordinator,
+    )
+    return coordinator
 
 
 def settings(base_url: str = "http://127.0.0.1:11434") -> SimpleNamespace:
@@ -51,7 +81,9 @@ def json_response(
 
 
 @pytest.mark.asyncio
-async def test_certified_request_is_preserved_with_bounded_native_options() -> None:
+async def test_certified_request_is_preserved_with_bounded_native_options(
+    _mock_local_inference_coordinator: PassThroughCoordinator,
+) -> None:
     captured: list[tuple[httpx.Request, dict[str, object]]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -62,7 +94,7 @@ async def test_certified_request_is_preserved_with_bounded_native_options() -> N
     result = await execute_local_ollama_provider_request(
         settings=settings(),
         request=original,
-        approved_model="qwen3:4b",
+        role=LocalModelRole.CONTINUITY_REASONING,
         transport=httpx.MockTransport(handler),
     )
 
@@ -93,6 +125,16 @@ async def test_certified_request_is_preserved_with_bounded_native_options() -> N
     assert result.elapsed_ms >= 0
     assert result.persisted is False
     assert result.inherited_context_was_attributed is True
+    assert _mock_local_inference_coordinator.calls == [
+        {
+            "base_url": "http://127.0.0.1:11434",
+            "expected_model": "qwen3:4b",
+            "expected_digest": (
+                "359d7dd4bcdab3d86b87d73ac27966f4dbb9f5efdfcc75d34a8764a09474fae7"
+            ),
+            "headers": None,
+        }
+    ]
 
 
 @pytest.mark.asyncio
@@ -113,7 +155,7 @@ async def test_nonlocal_or_unexpected_endpoint_is_rejected_before_transport(
         await execute_local_ollama_provider_request(
             settings=settings(base_url),
             request=provider_request(),
-            approved_model="qwen3:4b",
+            role=LocalModelRole.CONTINUITY_REASONING,
             transport=transport,
         )
     transport.assert_not_called()
@@ -128,20 +170,20 @@ async def test_blank_or_mismatched_model_is_rejected_before_transport(model: str
         await execute_local_ollama_provider_request(
             settings=settings(),
             request=request,
-            approved_model="qwen3:4b",
+            role=LocalModelRole.CONTINUITY_REASONING,
             transport=transport,
         )
     transport.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_blank_approved_model_is_rejected_before_transport() -> None:
+async def test_unknown_role_is_rejected_before_transport() -> None:
     transport = AsyncMock()
-    with pytest.raises(ValueError, match="approved model"):
+    with pytest.raises(ValueError, match="Unknown approved local model role"):
         await execute_local_ollama_provider_request(
             settings=settings(),
             request=provider_request(),
-            approved_model=" ",
+            role="unknown",  # type: ignore[arg-type]
             transport=transport,
         )
     transport.assert_not_called()
@@ -180,7 +222,7 @@ async def test_client_disables_proxy_inheritance_and_redirects(
     await execute_local_ollama_provider_request(
         settings=settings(),
         request=provider_request(),
-        approved_model="qwen3:4b",
+        role=LocalModelRole.CONTINUITY_REASONING,
     )
 
     assert captured_kwargs["trust_env"] is False
@@ -211,7 +253,7 @@ async def test_redirect_and_non_2xx_fail_once_without_retry() -> None:
             await execute_local_ollama_provider_request(
                 settings=settings(),
                 request=provider_request(),
-                approved_model="qwen3:4b",
+                role=LocalModelRole.CONTINUITY_REASONING,
                 transport=httpx.MockTransport(handler),
             )
         assert calls == 1
@@ -240,7 +282,7 @@ async def test_transport_failures_are_deterministic_and_not_retried(
         await execute_local_ollama_provider_request(
             settings=settings(),
             request=provider_request(),
-            approved_model="qwen3:4b",
+            role=LocalModelRole.CONTINUITY_REASONING,
             transport=httpx.MockTransport(handler),
         )
     assert calls == 1
@@ -274,7 +316,7 @@ async def test_overall_timeout_is_bounded_and_not_retried(
         await execute_local_ollama_provider_request(
             settings=settings(),
             request=provider_request(),
-            approved_model="qwen3:4b",
+            role=LocalModelRole.CONTINUITY_REASONING,
             transport=httpx.MockTransport(handler),
         )
     assert calls == 1
@@ -303,7 +345,7 @@ async def test_final_answer_and_reasoning_are_separated(
     result = await execute_local_ollama_provider_request(
         settings=settings(),
         request=provider_request(),
-        approved_model="qwen3:4b",
+        role=LocalModelRole.CONTINUITY_REASONING,
         transport=httpx.MockTransport(handler),
     )
 
@@ -324,7 +366,7 @@ async def test_alternate_reasoning_field_is_diagnostic_only() -> None:
     result = await execute_local_ollama_provider_request(
         settings=settings(),
         request=provider_request(),
-        approved_model="qwen3:4b",
+        role=LocalModelRole.CONTINUITY_REASONING,
         transport=httpx.MockTransport(handler),
     )
 
@@ -346,7 +388,7 @@ async def test_reasoning_only_or_missing_final_answer_is_rejected(content: str) 
         await execute_local_ollama_provider_request(
             settings=settings(),
             request=provider_request(),
-            approved_model="qwen3:4b",
+            role=LocalModelRole.CONTINUITY_REASONING,
             transport=httpx.MockTransport(handler),
         )
 
@@ -361,7 +403,7 @@ async def test_malformed_ollama_schema_is_rejected(payload: dict[str, object]) -
         await execute_local_ollama_provider_request(
             settings=settings(),
             request=provider_request(),
-            approved_model="qwen3:4b",
+            role=LocalModelRole.CONTINUITY_REASONING,
             transport=httpx.MockTransport(handler),
         )
 
@@ -375,7 +417,7 @@ async def test_malformed_json_is_rejected() -> None:
         await execute_local_ollama_provider_request(
             settings=settings(),
             request=provider_request(),
-            approved_model="qwen3:4b",
+            role=LocalModelRole.CONTINUITY_REASONING,
             transport=httpx.MockTransport(handler),
         )
 
@@ -393,7 +435,7 @@ async def test_malformed_reasoning_metadata_is_rejected() -> None:
         await execute_local_ollama_provider_request(
             settings=settings(),
             request=provider_request(),
-            approved_model="qwen3:4b",
+            role=LocalModelRole.CONTINUITY_REASONING,
             transport=httpx.MockTransport(handler),
         )
 
@@ -490,3 +532,5 @@ def test_certified_executor_exposes_no_control_override_parameters() -> None:
 
     assert "options" not in parameters
     assert "timeouts" not in parameters
+    assert "approved_model" not in parameters
+    assert "role" in parameters

@@ -12,7 +12,6 @@ import httpx
 from app.domain.agent_succession.contracts import RenderedSuccessionContext
 from app.domain.model_context.contracts import ModelContextModel, ProviderChatRequest
 from app.domain.model_context.ollama import (
-    OllamaContinuityOptions,
     OllamaHttpClient,
     build_ollama_succession_request_for_settings,
     ollama_chat_payload,
@@ -20,6 +19,8 @@ from app.domain.model_context.ollama import (
     submit_ollama_succession_request,
 )
 from app.domain.model_context.policy import is_local_inference_endpoint_url
+from app.domain.model_context.profiles import LocalModelRole, resolve_local_model_profile
+from app.infrastructure.local_inference import get_local_inference_coordinator
 
 
 class OllamaExecutionSettingsLike(Protocol):
@@ -90,7 +91,7 @@ async def execute_local_ollama_provider_request(
     *,
     settings: OllamaExecutionSettingsLike,
     request: ProviderChatRequest,
-    approved_model: str,
+    role: LocalModelRole,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> ModelExecutionResult:
     """Execute one certified provider request through a local-only Ollama boundary.
@@ -103,39 +104,43 @@ async def execute_local_ollama_provider_request(
     if not is_local_inference_endpoint_url(base_url):
         raise PermissionError("Local continuity execution forbids nonlocal Ollama endpoints")
 
-    expected_model = (approved_model or "").strip()
-    if not expected_model:
-        raise ValueError("An approved model must be supplied for local continuity execution")
+    profile = resolve_local_model_profile(role)
     if not request.model.strip():
         raise ValueError("The provider request model must not be blank")
-    if request.model != expected_model:
-        raise ValueError("The provider request model does not match the approved model")
+    if request.model != profile.model:
+        raise ValueError("The provider request model does not match the approved profile")
 
-    selected_options = OllamaContinuityOptions()
-    selected_timeouts = OllamaExecutionTimeouts()
     timeout = httpx.Timeout(
-        connect=selected_timeouts.connect_seconds,
-        read=selected_timeouts.read_seconds,
-        write=selected_timeouts.write_seconds,
-        pool=selected_timeouts.pool_seconds,
+        connect=profile.connect_seconds,
+        read=profile.read_seconds,
+        write=profile.write_seconds,
+        pool=profile.pool_seconds,
     )
     started = perf_counter()
-    async with httpx.AsyncClient(
-        timeout=timeout,
-        follow_redirects=False,
-        trust_env=False,
-        transport=transport,
-    ) as client:
-        async with asyncio.timeout(selected_timeouts.overall_seconds):
-            response = await client.post(
-                f"{base_url.rstrip('/')}/api/chat",
-                json=ollama_chat_payload(request, options=selected_options),
-                headers=_ollama_headers(settings),
-            )
-            response.raise_for_status()
-            payload = response.json()
+    headers = _ollama_headers(settings)
+    coordinator = get_local_inference_coordinator()
+    async with coordinator.acquire(
+        base_url=base_url,
+        expected_model=profile.model,
+        expected_digest=profile.model_digest,
+        headers=headers,
+    ):
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+            trust_env=False,
+            transport=transport,
+        ) as client:
+            async with asyncio.timeout(profile.overall_seconds):
+                response = await client.post(
+                    f"{base_url.rstrip('/')}/api/chat",
+                    json=ollama_chat_payload(request, profile=profile),
+                    headers=headers,
+                )
+                response.raise_for_status()
+                payload = response.json()
 
-    parsed = parse_ollama_chat_response(payload)
+        parsed = parse_ollama_chat_response(payload)
     elapsed_ms = max(0, round((perf_counter() - started) * 1000))
     return ModelExecutionResult(
         model=request.model,

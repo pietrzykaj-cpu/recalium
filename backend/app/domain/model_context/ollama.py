@@ -10,6 +10,7 @@ from typing import Any, Protocol
 
 from app.domain.agent_succession.contracts import RenderedSuccessionContext
 from app.domain.model_context.contracts import ContextSegment, ProviderChatRequest, ProviderMessage
+from app.domain.model_context.profiles import ApprovedLocalModelProfile
 
 
 class OllamaHttpClient(Protocol):
@@ -111,9 +112,12 @@ def build_ollama_succession_request_for_settings(
 def ollama_chat_payload(
     request: ProviderChatRequest,
     *,
+    profile: ApprovedLocalModelProfile | None = None,
     options: OllamaContinuityOptions | None = None,
 ) -> dict[str, Any]:
-    """Return a native `/api/chat` payload, with bounded Phase 2C options when supplied."""
+    """Return a native `/api/chat` payload with application-owned controls."""
+    if profile is not None and options is not None:
+        raise ValueError("Supply an approved profile or legacy options, not both")
     payload: dict[str, Any] = {
         "model": request.model,
         "stream": False,
@@ -121,7 +125,21 @@ def ollama_chat_payload(
         "options": {"temperature": 0},
         "messages": [message.model_dump() for message in request.messages],
     }
-    if options is not None:
+    if profile is not None:
+        payload.update(
+            {
+                "stream": profile.stream,
+                "think": profile.think,
+                "keep_alive": profile.keep_alive,
+                "options": {
+                    "temperature": profile.temperature,
+                    "seed": profile.seed,
+                    "num_ctx": profile.num_ctx,
+                    "num_predict": profile.num_predict,
+                },
+            }
+        )
+    elif options is not None:
         payload.update(
             {
                 "think": options.think,
