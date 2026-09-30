@@ -1,15 +1,40 @@
 """Regression coverage for Qwen final answers and the extraction envelope."""
 import json
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+
 from app.worker import dispatcher as d
 
 TEXT = 'My favourite test mug is purple. I always keep it beside my laptop when I work.'
 FACT = {'fact_text': 'The test mug is purple.', 'source_span': 'My favourite test mug is purple.',
         'confidence_tier': 'high', 'entities': [], 'tags': ['preference']}
+
+
+class FakeCoordinator:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    @asynccontextmanager
+    async def acquire(self, **kwargs: object) -> AsyncIterator[None]:
+        self.calls.append(kwargs)
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _clean_db_between_tests() -> None:
+    """Override the repository DB fixture for this mocked worker module."""
+
+
+@pytest.fixture(autouse=True)
+def coordinator(monkeypatch):
+    value = FakeCoordinator()
+    monkeypatch.setattr(d, 'get_local_inference_coordinator', lambda: value)
+    return value
 
 
 @pytest.fixture
@@ -57,11 +82,12 @@ async def test_missing_final_answer_is_failure(monkeypatch, settings, raw):
         await d._ollama_chat('system', TEXT, allow_external=False)
 
 
-async def test_qwen_request_schema_and_locality(monkeypatch, settings):
+async def test_qwen_request_schema_and_locality(monkeypatch, settings, coordinator):
     client, factory = mock_http(monkeypatch, '{"facts": []}')
     await d._extract_chunk(TEXT, allow_external=False)
     payload = client.post.call_args.kwargs['json']
     assert payload['think'] is False
+    assert payload['keep_alive'] == '0s'
     assert payload['messages'][0]['content'] == d.FACT_EXTRACTION_SYSTEM_PROMPT
     assert payload['messages'][1]['content'] == TEXT
     assert isinstance(payload['format'], dict)
@@ -69,6 +95,12 @@ async def test_qwen_request_schema_and_locality(monkeypatch, settings):
     assert payload['format']['properties']['facts']['type'] == 'array'
     assert factory.call_args.kwargs['trust_env'] is False
     assert factory.call_args.kwargs['follow_redirects'] is False
+    assert coordinator.calls == [{
+        'base_url': settings.ollama_base_url,
+        'expected_model': settings.ollama_model,
+        'expected_digest': None,
+        'headers': None,
+    }]
 
 
 async def test_other_models_do_not_receive_qwen_switch(monkeypatch, settings):
@@ -76,6 +108,17 @@ async def test_other_models_do_not_receive_qwen_switch(monkeypatch, settings):
     client, _ = mock_http(monkeypatch, 'Final.')
     await d._ollama_chat('system', TEXT)
     assert client.post.call_args.kwargs['json']['messages'][0]['content'] == 'system'
+
+
+async def test_remote_ollama_bypasses_local_coordinator(monkeypatch, settings, coordinator):
+    settings.ollama_base_url = 'https://ollama.example.com'
+    client, factory = mock_http(monkeypatch, 'Final.')
+
+    assert await d._ollama_chat('system', TEXT, allow_external=True) == 'Final.'
+
+    assert coordinator.calls == []
+    assert factory.call_args.kwargs['trust_env'] is True
+    assert 'keep_alive' not in client.post.call_args.kwargs['json']
 
 
 async def test_400_is_not_blindly_retried(monkeypatch, settings):

@@ -35,6 +35,7 @@ from app.domain.jobs.service import (
     set_pending_provider,
 )
 from app.domain.policy.gate import SensitivityGate
+from app.infrastructure.local_inference import get_local_inference_coordinator
 from app.infrastructure.settings import get_settings
 
 logger = logging.getLogger(__name__)
@@ -253,7 +254,8 @@ async def _ollama_chat(
     import httpx  # noqa: PLC0415
 
     settings = get_settings()
-    if not allow_external and not _is_local_ollama_url(settings.ollama_base_url):
+    local_endpoint = _is_local_ollama_url(settings.ollama_base_url)
+    if not allow_external and not local_endpoint:
         raise PermissionError("Policy forbids remote Ollama processing")
     payload: dict[str, Any] = {
         "model": settings.ollama_model,
@@ -265,6 +267,8 @@ async def _ollama_chat(
         "think": False,
         "options": {"temperature": 0},
     }
+    if local_endpoint:
+        payload["keep_alive"] = "0s"
     if format_json:
         payload["format"] = _OllamaExtraction.model_json_schema()
     headers = (
@@ -273,13 +277,30 @@ async def _ollama_chat(
         else None
     )
     url = f"{settings.ollama_base_url.rstrip('/')}/api/chat"
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(300.0, connect=10.0),
-        follow_redirects=False, trust_env=allow_external,
-    ) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        return _ollama_final_content(resp.json().get("message", {}).get("content") or "")
+
+    async def send_once() -> str:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(300.0, connect=10.0),
+            follow_redirects=False,
+            trust_env=allow_external and not local_endpoint,
+        ) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            return _ollama_final_content(
+                resp.json().get("message", {}).get("content") or ""
+            )
+
+    if not local_endpoint:
+        return await send_once()
+
+    coordinator = get_local_inference_coordinator()
+    async with coordinator.acquire(
+        base_url=settings.ollama_base_url,
+        expected_model=settings.ollama_model,
+        expected_digest=None,
+        headers=headers,
+    ):
+        return await send_once()
 
 async def _run_summarize_job(text: str, *, allow_external: bool = True) -> str | None:
     """Run LLM summarization via the configured provider/model (F1/F2).
