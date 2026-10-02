@@ -119,8 +119,8 @@ class ConsumptionIntegrity(ModelContextModel):
 
 
 class ContinuityConsumptionPayload(ModelContextModel):
-    schema_version: Literal["recalium.continuity-consumption.v1"] = (
-        "recalium.continuity-consumption.v1"
+    schema_version: Literal["recalium.continuity-consumption.v2"] = (
+        "recalium.continuity-consumption.v2"
     )
     system_instructions: tuple[str, ...]
     continuity: ContinuityStructuredContext
