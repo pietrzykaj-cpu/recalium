@@ -73,11 +73,15 @@ def json_response(
     content: object = "Final answer.",
     thinking: object | None = None,
     status: int = 200,
+    diagnostics: dict[str, object] | None = None,
 ) -> httpx.Response:
     message: dict[str, object] = {"content": content}
     if thinking is not None:
         message["thinking"] = thinking
-    return httpx.Response(status, json={"message": message}, request=request)
+    payload: dict[str, object] = {"message": message}
+    if diagnostics is not None:
+        payload.update(diagnostics)
+    return httpx.Response(status, json=payload, request=request)
 
 
 @pytest.mark.asyncio
@@ -135,6 +139,175 @@ async def test_certified_request_is_preserved_with_bounded_native_options(
             "headers": None,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_completion_diagnostics_are_allowlisted_without_changing_content() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(
+            request,
+            thinking="private trace",
+            diagnostics={
+                "done": True,
+                "done_reason": "stop",
+                "prompt_eval_count": 91,
+                "eval_count": 37,
+                "total_duration": 9_000_000_000,
+                "load_duration": 500_000_000,
+                "prompt_eval_duration": 2_000_000_000,
+                "eval_duration": 6_500_000_000,
+                "context": [101, 202],
+                "tool_calls": [{"function": "forbidden"}],
+                "unknown_provider_field": "must not escape",
+            },
+        )
+
+    result = await execute_local_ollama_provider_request(
+        settings=settings(),
+        request=provider_request(),
+        role=LocalModelRole.CONTINUITY_REASONING,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.content == "Final answer."
+    assert result.reasoning_present is True
+    assert result.ollama_diagnostics is not None
+    assert result.ollama_diagnostics.model_dump() == {
+        "done": True,
+        "done_reason": "stop",
+        "prompt_eval_count": 91,
+        "eval_count": 37,
+        "total_duration_ns": 9_000_000_000,
+        "load_duration_ns": 500_000_000,
+        "prompt_eval_duration_ns": 2_000_000_000,
+        "eval_duration_ns": 6_500_000_000,
+    }
+    serialized_result = result.model_dump_json()
+    serialized_diagnostics = result.ollama_diagnostics.model_dump_json()
+    assert "private trace" not in serialized_result
+    assert "[101,202]" not in serialized_result
+    assert "forbidden" not in serialized_result
+    assert "unknown_provider_field" not in serialized_result
+    assert "context" not in serialized_diagnostics
+    assert "tool_calls" not in serialized_diagnostics
+
+
+@pytest.mark.asyncio
+async def test_length_completion_remains_successful_and_observational() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(
+            request,
+            diagnostics={"done": True, "done_reason": "length", "eval_count": 512},
+        )
+
+    result = await execute_local_ollama_provider_request(
+        settings=settings(),
+        request=provider_request(),
+        role=LocalModelRole.CONTINUITY_REASONING,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.content == "Final answer."
+    assert result.ollama_diagnostics is not None
+    assert result.ollama_diagnostics.done_reason == "length"
+    assert result.ollama_diagnostics.eval_count == 512
+
+
+@pytest.mark.asyncio
+async def test_content_parse_failure_keeps_exact_error_and_exposes_diagnostics() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(
+            request,
+            content="",
+            diagnostics={"done": True, "done_reason": "length", "eval_count": 512},
+        )
+
+    with pytest.raises(ValueError) as exc_info:
+        await execute_local_ollama_provider_request(
+            settings=settings(),
+            request=provider_request(),
+            role=LocalModelRole.CONTINUITY_REASONING,
+            transport=httpx.MockTransport(handler),
+        )
+
+    assert type(exc_info.value) is ValueError
+    assert str(exc_info.value) == "Ollama returned no final answer"
+    diagnostics = getattr(exc_info.value, "ollama_diagnostics", None)
+    assert diagnostics is not None
+    assert diagnostics.done_reason == "length"
+    assert diagnostics.eval_count == 512
+
+
+@pytest.mark.asyncio
+async def test_response_without_completion_diagnostics_remains_compatible() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(request)
+
+    result = await execute_local_ollama_provider_request(
+        settings=settings(),
+        request=provider_request(),
+        role=LocalModelRole.CONTINUITY_REASONING,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.content == "Final answer."
+    assert result.ollama_diagnostics is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_done_reason", [42, "x" * 65])
+async def test_malformed_completion_diagnostics_are_individually_ignored(
+    invalid_done_reason: object,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(
+            request,
+            diagnostics={
+                "done": 1,
+                "done_reason": invalid_done_reason,
+                "prompt_eval_count": "91",
+                "eval_count": True,
+                "total_duration": -1,
+                "load_duration": 1.5,
+                "prompt_eval_duration": False,
+                "eval_duration": "6500000000",
+            },
+        )
+
+    result = await execute_local_ollama_provider_request(
+        settings=settings(),
+        request=provider_request(),
+        role=LocalModelRole.CONTINUITY_REASONING,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.ollama_diagnostics is not None
+    assert all(value is None for value in result.ollama_diagnostics.model_dump().values())
+
+
+@pytest.mark.asyncio
+async def test_client_elapsed_time_is_not_derived_from_ollama_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter((10.0, 10.123))
+    monkeypatch.setattr(
+        "app.domain.model_context.execution.perf_counter",
+        lambda: next(clock),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return json_response(request, diagnostics={"total_duration": 9_000_000_000})
+
+    result = await execute_local_ollama_provider_request(
+        settings=settings(),
+        request=provider_request(),
+        role=LocalModelRole.CONTINUITY_REASONING,
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert result.elapsed_ms == 123
+    assert result.ollama_diagnostics is not None
+    assert result.ollama_diagnostics.total_duration_ns == 9_000_000_000
 
 
 @pytest.mark.asyncio

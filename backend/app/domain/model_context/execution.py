@@ -12,6 +12,7 @@ import httpx
 from app.domain.agent_succession.contracts import RenderedSuccessionContext
 from app.domain.model_context.contracts import ModelContextModel, ProviderChatRequest
 from app.domain.model_context.ollama import (
+    OllamaCompletionDiagnostics,
     OllamaHttpClient,
     build_ollama_succession_request_for_settings,
     ollama_chat_payload,
@@ -41,6 +42,7 @@ class ModelExecutionResult(ModelContextModel):
     reasoning_present: bool = False
     http_status: int | None = None
     elapsed_ms: int | None = None
+    ollama_diagnostics: OllamaCompletionDiagnostics | None = None
     inherited_context_was_attributed: Literal[True] = True
     persisted: Literal[False] = False
 
@@ -149,6 +151,7 @@ async def execute_local_ollama_provider_request(
         reasoning_present=parsed.reasoning_present,
         http_status=response.status_code,
         elapsed_ms=elapsed_ms,
+        ollama_diagnostics=parsed.diagnostics,
     )
 
 

@@ -9,7 +9,12 @@ from math import isfinite
 from typing import Any, Protocol
 
 from app.domain.agent_succession.contracts import RenderedSuccessionContext
-from app.domain.model_context.contracts import ContextSegment, ProviderChatRequest, ProviderMessage
+from app.domain.model_context.contracts import (
+    ContextSegment,
+    ModelContextModel,
+    ProviderChatRequest,
+    ProviderMessage,
+)
 from app.domain.model_context.profiles import ApprovedLocalModelProfile
 
 
@@ -64,6 +69,64 @@ class ParsedOllamaMessage:
 
     content: str
     reasoning_present: bool
+    diagnostics: OllamaCompletionDiagnostics | None
+
+
+class OllamaCompletionDiagnostics(ModelContextModel):
+    """Allowlisted observational metadata from one Ollama completion."""
+
+    done: bool | None = None
+    done_reason: str | None = None
+    prompt_eval_count: int | None = None
+    eval_count: int | None = None
+    total_duration_ns: int | None = None
+    load_duration_ns: int | None = None
+    prompt_eval_duration_ns: int | None = None
+    eval_duration_ns: int | None = None
+
+
+_OLLAMA_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "done",
+        "done_reason",
+        "prompt_eval_count",
+        "eval_count",
+        "total_duration",
+        "load_duration",
+        "prompt_eval_duration",
+        "eval_duration",
+    }
+)
+_OLLAMA_DONE_REASON = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}")
+
+
+def _nonnegative_int(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def parse_ollama_completion_diagnostics(
+    payload: Any,
+) -> OllamaCompletionDiagnostics | None:
+    """Read only the bounded completion metadata Recalium explicitly recognizes."""
+    if not isinstance(payload, Mapping) or not any(
+        field in payload for field in _OLLAMA_DIAGNOSTIC_FIELDS
+    ):
+        return None
+
+    done_reason = payload.get("done_reason")
+    if not isinstance(done_reason, str) or _OLLAMA_DONE_REASON.fullmatch(done_reason) is None:
+        done_reason = None
+
+    return OllamaCompletionDiagnostics(
+        done=payload.get("done") if type(payload.get("done")) is bool else None,
+        done_reason=done_reason,
+        prompt_eval_count=_nonnegative_int(payload.get("prompt_eval_count")),
+        eval_count=_nonnegative_int(payload.get("eval_count")),
+        total_duration_ns=_nonnegative_int(payload.get("total_duration")),
+        load_duration_ns=_nonnegative_int(payload.get("load_duration")),
+        prompt_eval_duration_ns=_nonnegative_int(payload.get("prompt_eval_duration")),
+        eval_duration_ns=_nonnegative_int(payload.get("eval_duration")),
+    )
 
 
 def build_ollama_succession_request(
@@ -188,27 +251,40 @@ def ollama_final_content(raw: str) -> tuple[str, bool]:
 
 
 def parse_ollama_chat_response(payload: Any) -> ParsedOllamaMessage:
-    """Validate an Ollama chat response without exposing reasoning as content."""
-    if not isinstance(payload, Mapping):
-        raise TypeError("Ollama chat response is not an object")
-    message = payload.get("message")
-    if not isinstance(message, Mapping):
-        raise TypeError("Ollama chat response has no usable message content")
-    raw_content = message.get("content")
-    if not isinstance(raw_content, str):
-        raise TypeError("Ollama chat response has no usable message content")
+    """Validate content while retaining bounded diagnostics on success or failure.
 
-    reasoning_present = False
-    for field in ("thinking", "reasoning"):
-        value = message.get(field)
-        if value is not None and not isinstance(value, str):
-            raise ValueError(f"Ollama chat response has invalid {field} metadata")
-        reasoning_present = reasoning_present or bool(value and value.strip())
+    When strict content validation raises, the original exception type and
+    message remain unchanged. If completion diagnostics were present, callers
+    can inspect them through ``error.ollama_diagnostics``.
+    """
+    diagnostics = parse_ollama_completion_diagnostics(payload)
+    try:
+        if not isinstance(payload, Mapping):
+            raise TypeError("Ollama chat response is not an object")
+        message = payload.get("message")
+        if not isinstance(message, Mapping):
+            raise TypeError("Ollama chat response has no usable message content")
+        raw_content = message.get("content")
+        if not isinstance(raw_content, str):
+            raise TypeError("Ollama chat response has no usable message content")
 
-    content, embedded_reasoning = ollama_final_content(raw_content)
+        reasoning_present = False
+        for field in ("thinking", "reasoning"):
+            value = message.get(field)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"Ollama chat response has invalid {field} metadata")
+            reasoning_present = reasoning_present or bool(value and value.strip())
+
+        content, embedded_reasoning = ollama_final_content(raw_content)
+    except (TypeError, ValueError) as error:
+        if diagnostics is not None:
+            error.ollama_diagnostics = diagnostics  # type: ignore[union-attr]
+        raise
+
     return ParsedOllamaMessage(
         content=content,
         reasoning_present=reasoning_present or embedded_reasoning,
+        diagnostics=diagnostics,
     )
 
 
