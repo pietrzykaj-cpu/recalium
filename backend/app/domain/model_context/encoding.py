@@ -25,9 +25,11 @@ _INVISIBLE_RANGES = (
     (0xFE00, 0xFE0F),
     (0xFEFF, 0xFEFF),
     (0xFFA0, 0xFFA0),
+    (0xFFF9, 0xFFFB),
     (0x1BCA0, 0x1BCA3),
     (0x1D173, 0x1D17A),
     (0xE0000, 0xE007F),
+    (0xE0100, 0xE01EF),
 )
 
 
@@ -133,12 +135,16 @@ def decode_label(value: str) -> str:
 
 
 def encode_prose(value: str) -> str:
-    """Keep benign prose readable while escaping line/invisible structure."""
+    """Encode untrusted prose as one deterministic quoted grammar token."""
 
-    return _escape_text(value, allow_tab=False, allow_lf=False)
+    encoded = _escape_text(value, allow_tab=False, allow_lf=False)
+    return json.dumps(encoded, ensure_ascii=False, separators=(",", ":"))
 
 
 def decode_prose(value: str) -> str:
     """Reverse :func:`encode_prose`."""
 
-    return _unescape_text(value)
+    decoded = json.loads(value)
+    if not isinstance(decoded, str):
+        raise TypeError("Encoded continuity prose must be a JSON string")
+    return _unescape_text(decoded)
