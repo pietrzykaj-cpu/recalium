@@ -48,6 +48,7 @@ from app.domain.context_packets.service import build_context_packet
 from app.domain.derived_memory.models import Fact, Summary
 from app.domain.ingest.service import ingest_text_content
 from app.domain.jobs.models import Job
+from app.domain.model_context.encoding import encode_label, render_body_lines
 from app.domain.retrieval.diagnostics import RetrievalDiagnostics
 from app.domain.retrieval.service import (
     RetrievalFilters,
@@ -499,18 +500,19 @@ def _authority_decisions(authority_results, *, include_historical):
 def _authority_lines(authority_results, *, include_historical):
     lines = ["AUTHORITATIVE CURRENT STATE"]
     for result in authority_results:
-        key = result["authority_key"]
+        key = encode_label(result["authority_key"])
         status = result["status"].upper()
         if result["status"] == "current":
             current = result["current_record"]
-            lines.append(f"- {key}: CURRENT record {current['id']}: {current['content']}")
+            lines.append(f"- {key}: CURRENT record {encode_label(current['id'])}:")
+            lines.extend(render_body_lines(current["content"]))
         elif result["status"] == "ambiguous":
-            ids = ", ".join(record["id"] for record in result.get("competing_records") or [])
+            ids = ", ".join(encode_label(record["id"]) for record in result.get("competing_records") or [])
             lines.append(f"- {key}: AMBIGUOUS; competing records: {ids or 'unavailable'}; do not guess.")
         else:
             lines.append(f"- {key}: {status}; no authoritative current record.")
         if include_historical and result.get("historical_records"):
-            ids = ", ".join(record["id"] for record in result["historical_records"])
+            ids = ", ".join(encode_label(record["id"]) for record in result["historical_records"])
             lines.append(f"  Historical/superseded records: {ids}.")
     return lines
 
@@ -564,7 +566,9 @@ async def _continuity_handoff(session, actor, req: ContinuityHandoffInput, space
         generated_at=packet.generated_at,
     )
     base_budget = max(200, req.render_max_chars - 1200)
-    rendered_base = render_agent_succession_context(envelope, max_chars=base_budget)
+    rendered_base = render_agent_succession_context(
+        envelope, max_chars=base_budget, encode_values=True,
+    )
     lines = _authority_lines(authority_results, include_historical=req.include_historical)
     lines.extend([
         "SUPPORTING MEMORY (NON-AUTHORITATIVE)",
