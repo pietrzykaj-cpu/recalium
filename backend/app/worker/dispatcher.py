@@ -34,6 +34,7 @@ from app.domain.jobs.service import (
     fail_job,
     set_pending_provider,
 )
+from app.domain.model_context.ollama import parse_ollama_completion_diagnostics
 from app.domain.policy.gate import SensitivityGate
 from app.infrastructure.local_inference import get_local_inference_coordinator
 from app.infrastructure.settings import get_settings
@@ -286,8 +287,15 @@ async def _ollama_chat(
         ) as client:
             resp = await client.post(url, json=payload, headers=headers)
             resp.raise_for_status()
+            response_payload = resp.json()
+            diagnostics = parse_ollama_completion_diagnostics(response_payload)
+            if diagnostics is not None:
+                fields = diagnostics.model_dump(exclude_none=True)
+                if fields:
+                    # Observe only shared-policy metadata, even if content parsing fails.
+                    logger.info("Ollama completion diagnostics: %s", fields)
             return _ollama_final_content(
-                resp.json().get("message", {}).get("content") or ""
+                response_payload.get("message", {}).get("content") or ""
             )
 
     if not local_endpoint:

@@ -1,5 +1,6 @@
 """Regression coverage for Qwen final answers and the extraction envelope."""
 import json
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -47,8 +48,10 @@ def settings(monkeypatch):
     return value
 
 
-def mock_http(monkeypatch, content, status=200):
-    response = httpx.Response(status, json={'message': {'content': content, 'thinking': 'private trace'}},
+def mock_http(monkeypatch, content, status=200, metadata=None):
+    payload = {'message': {'content': content, 'thinking': 'private trace'}}
+    payload.update(metadata or {})
+    response = httpx.Response(status, json=payload,
                               request=httpx.Request('POST', 'http://localhost/api/chat'))
     client = AsyncMock()
     client.post.return_value = response
@@ -161,3 +164,118 @@ async def test_facts_survive_and_span_checks_remain(monkeypatch, settings):
 async def test_link_classifier_consumes_final_answer(monkeypatch, settings):
     mock_http(monkeypatch, 'Let me reason.\n</think>\nsupports')
     assert await d._classify_link_pair('A', 'B') == 'supports'
+
+
+def completion_records(caplog):
+    return [record for record in caplog.records
+            if record.name == d.logger.name
+            and record.msg == 'Ollama completion diagnostics: %s']
+
+
+@pytest.mark.parametrize('reason', ['stop', 'length'])
+async def test_completion_diagnostics_are_observable_without_content_changes(
+    monkeypatch, settings, caplog, reason,
+):
+    metadata = {
+        'done': True, 'done_reason': reason, 'prompt_eval_count': 91, 'eval_count': 37,
+        'total_duration': 9000, 'load_duration': 500,
+        'prompt_eval_duration': 2000, 'eval_duration': 6500,
+        'context': [101, 202], 'tool_calls': [{'private': 'tool-secret'}],
+        'reasoning': 'reasoning-secret', 'prompt': 'prompt-secret',
+        'unknown_provider_field': 'unknown-secret',
+    }
+    settings.ollama_api_key = 'key-secret'
+    mock_http(monkeypatch, '<think>embedded-secret</think>\nFinal-secret.', metadata=metadata)
+    with caplog.at_level(logging.INFO, logger=d.logger.name):
+        result = await d._ollama_chat('system-secret', TEXT, allow_external=False)
+    assert type(result) is str
+    assert result == 'Final-secret.'
+    records = completion_records(caplog)
+    assert len(records) == 1
+    assert records[0].args == {
+        'done': True, 'done_reason': reason, 'prompt_eval_count': 91, 'eval_count': 37,
+        'total_duration_ns': 9000, 'load_duration_ns': 500,
+        'prompt_eval_duration_ns': 2000, 'eval_duration_ns': 6500,
+    }
+    for private in ['private trace', 'tool-secret', 'reasoning-secret', 'prompt-secret',
+                    'unknown-secret', 'key-secret', 'embedded-secret', 'Final-secret.',
+                    'system-secret', TEXT, '[101, 202]']:
+        assert private not in caplog.text
+
+
+@pytest.mark.parametrize('metadata', [None, {'reasoning': 'secret', 'context': [1]}, {
+    'done': 1, 'done_reason': 'bad\nreason', 'eval_count': True,
+    'prompt_eval_count': '91', 'total_duration': -1, 'load_duration': 1.5,
+    'eval_duration': '6500', 'prompt_eval_duration': False,
+}])
+async def test_missing_or_invalid_diagnostics_remain_harmless(
+    monkeypatch, settings, caplog, metadata,
+):
+    mock_http(monkeypatch, 'Final.', metadata=metadata)
+    with caplog.at_level(logging.INFO, logger=d.logger.name):
+        assert await d._ollama_chat('system', TEXT, allow_external=False) == 'Final.'
+    assert completion_records(caplog) == []
+
+
+async def test_partial_diagnostics_are_filtered(monkeypatch, settings, caplog):
+    mock_http(monkeypatch, 'Final.', metadata={
+        'done': False, 'done_reason': 42, 'eval_count': 0, 'total_duration': -1,
+    })
+    with caplog.at_level(logging.INFO, logger=d.logger.name):
+        assert await d._ollama_chat('system', TEXT, allow_external=False) == 'Final.'
+    assert completion_records(caplog)[0].args == {'done': False, 'eval_count': 0}
+
+
+async def test_diagnostics_survive_existing_content_failure(monkeypatch, settings, caplog):
+    mock_http(monkeypatch, '<think>private trace</think>', metadata={
+        'done': True, 'done_reason': 'length', 'eval_count': 512,
+    })
+    with caplog.at_level(logging.INFO, logger=d.logger.name):
+        with pytest.raises(ValueError, match='^Ollama returned no final answer$'):
+            await d._ollama_chat('system', TEXT, allow_external=False)
+    assert completion_records(caplog)[0].args == {
+        'done': True, 'done_reason': 'length', 'eval_count': 512,
+    }
+    assert 'private trace' not in caplog.text
+
+
+async def test_http_failure_is_not_a_completion(monkeypatch, settings, caplog):
+    client, _ = mock_http(monkeypatch, 'Final.', status=503, metadata={'done': True})
+    with caplog.at_level(logging.INFO, logger=d.logger.name):
+        with pytest.raises(httpx.HTTPStatusError):
+            await d._ollama_chat('system', TEXT, allow_external=False)
+    assert completion_records(caplog) == []
+    assert client.post.await_count == 1
+
+
+@pytest.mark.parametrize('operation,content,expected', [
+    ('summary', 'Summary.', 'Summary.'),
+    ('extract', '{"facts": []}', []),
+    ('link', 'supports', 'supports'),
+])
+async def test_worker_operations_keep_diagnostics_observable(
+    monkeypatch, settings, caplog, operation, content, expected,
+):
+    mock_http(monkeypatch, content, metadata={'done_reason': 'stop'})
+    with caplog.at_level(logging.INFO, logger=d.logger.name):
+        if operation == 'summary':
+            result = await d._run_summarize_job(TEXT, allow_external=False)
+        elif operation == 'extract':
+            result = await d._extract_chunk(TEXT, allow_external=False)
+        else:
+            result = await d._classify_link_pair('A', 'B')
+    assert result == expected
+    assert len(completion_records(caplog)) == 1
+    assert completion_records(caplog)[0].args == {'done_reason': 'stop'}
+
+
+async def test_worker_keeps_legacy_reasoning_metadata_tolerance(monkeypatch, settings, caplog):
+    mock_http(monkeypatch, 'unused', metadata={
+        'done_reason': 'stop',
+        'message': {'content': 'Final.', 'thinking': {'private': 'secret'},
+                    'reasoning': ['private-secret'], 'tool_calls': ['tool-secret']},
+    })
+    with caplog.at_level(logging.INFO, logger=d.logger.name):
+        assert await d._ollama_chat('system', TEXT, allow_external=False) == 'Final.'
+    assert completion_records(caplog)[0].args == {'done_reason': 'stop'}
+    assert 'secret' not in caplog.text
