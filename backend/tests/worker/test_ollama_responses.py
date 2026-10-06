@@ -256,7 +256,7 @@ async def test_http_failure_is_not_a_completion(monkeypatch, settings, caplog):
 async def test_worker_operations_keep_diagnostics_observable(
     monkeypatch, settings, caplog, operation, content, expected,
 ):
-    mock_http(monkeypatch, content, metadata={'done_reason': 'stop'})
+    client, _ = mock_http(monkeypatch, content, metadata={'done_reason': 'stop'})
     with caplog.at_level(logging.INFO, logger=d.logger.name):
         if operation == 'summary':
             result = await d._run_summarize_job(TEXT, allow_external=False)
@@ -265,6 +265,15 @@ async def test_worker_operations_keep_diagnostics_observable(
         else:
             result = await d._classify_link_pair('A', 'B')
     assert result == expected
+    assert client.post.await_count == 1
+    payload = client.post.call_args.kwargs['json']
+    assert payload['model'] == settings.ollama_model
+    assert payload['stream'] is False
+    assert payload['think'] is False
+    assert payload['keep_alive'] == '0s'
+    assert payload['options'] == {'temperature': 0, 'num_ctx': 4096}
+    assert 'num_batch' not in payload['options']
+    assert 'num_ubatch' not in payload['options']
     assert len(completion_records(caplog)) == 1
     assert completion_records(caplog)[0].args == {'done_reason': 'stop'}
 
