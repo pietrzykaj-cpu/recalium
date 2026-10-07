@@ -5,6 +5,8 @@ Tests will FAIL (RED) until app.worker.dispatcher is created.
 from __future__ import annotations
 
 import uuid
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -176,3 +178,100 @@ def test_dedupe_facts_removes_near_identical_statements():
     result = _dedupe_facts(facts)
     assert len(result) == 2
     assert result[0]["fact_text"] == "The capital of France is Paris."
+
+
+@pytest.fixture
+def bounded_summary_pipeline(monkeypatch):
+    """Exercise dispatcher writes without DB, embedding, or provider runtime."""
+    from app.worker import dispatcher as d
+    from app.domain.policy.gate import SensitivityDecision
+
+    archive = SimpleNamespace(raw_content="small input", metadata_json={})
+    session = MagicMock()
+    session.execute = AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: archive))
+    session.commit = AsyncMock()
+    session.rollback = AsyncMock()
+    session.refresh = AsyncMock()
+    job = SimpleNamespace(id=uuid.uuid4(), raw_archive_id=uuid.uuid4())
+    settings = SimpleNamespace(
+        summarize_provider="ollama", extract_provider="ollama",
+        summarize_model="auto", extract_model="auto", ollama_model="qwen3:4b",
+        ollama_base_url="http://localhost:11434", ollama_api_key="",
+        openai_api_key="test-only", anthropic_api_key="test-only",
+    )
+    monkeypatch.setattr(d, "get_settings", lambda: settings)
+    monkeypatch.setattr(d._gate, "classify_async", AsyncMock(return_value=SensitivityDecision(
+        category="general", confidence=0.9, blocked=False, method="test",
+    )))
+    services = "app.domain.derived_memory.service."
+    for name in ("get_existing_summary", "get_existing_embedding", "write_summary",
+                 "write_facts", "write_fts_entry", "write_embedding", "write_tags"):
+        monkeypatch.setattr(services + name, AsyncMock(return_value=None))
+    monkeypatch.setattr(services + "embed_text", AsyncMock(return_value=[0.1] * 384))
+    monkeypatch.setattr("app.domain.archive.service.suppress_new_derivations_if_deleted", AsyncMock())
+    monkeypatch.setattr(d, "_run_link_detection_job", AsyncMock())
+    monkeypatch.setattr(d, "complete_job", AsyncMock())
+    monkeypatch.setattr(d, "fail_job", AsyncMock())
+    monkeypatch.setattr(d, "_run_summarize_job", AsyncMock(return_value="A summary"))
+    monkeypatch.setattr(d, "_run_extract_job", AsyncMock(return_value=[]))
+    from app.domain.derived_memory import service
+    return session, job, archive, settings, service
+
+
+@pytest.mark.parametrize("provider,size,expected", [
+    ("ollama", 2047, "llm_summarization"),
+    ("ollama", 2048, "llm_summarization"),
+    ("ollama", 2049, "llm_summarization_bounded"),
+    ("openai", 6000, "llm_summarization"),
+    ("anthropic", 6000, "llm_summarization"),
+])
+async def test_bounded_summary_provenance(monkeypatch, bounded_summary_pipeline, provider, size, expected):
+    from app.worker import dispatcher as d
+    session, job, archive, settings, service = bounded_summary_pipeline
+    archive.raw_content = "x" * size
+    settings.summarize_provider = provider
+    await d.dispatch_job(session, job)
+    service.write_summary.assert_awaited_once()
+    assert service.write_summary.call_args.kwargs["derivation_method"] == expected
+    assert service.write_summary.call_args.kwargs["summary_text"] == "A summary"
+    d._run_extract_job.assert_awaited_once_with(archive.raw_content, allow_external=True)
+    d.complete_job.assert_awaited_once()
+    d.fail_job.assert_not_awaited()
+
+
+async def test_bounded_summary_provenance_uses_utf8_bytes(bounded_summary_pipeline):
+    from app.worker import dispatcher as d
+    session, job, archive, settings, service = bounded_summary_pipeline
+    archive.raw_content = "😀" * 600
+    assert len(archive.raw_content) <= d.SUMMARY_INPUT_MAX_BYTES
+    assert len(archive.raw_content.encode("utf-8")) > d.SUMMARY_INPUT_MAX_BYTES
+    await d.dispatch_job(session, job)
+    service.write_summary.assert_awaited_once()
+    assert service.write_summary.call_args.kwargs["derivation_method"] == "llm_summarization_bounded"
+
+
+async def test_bounded_summary_failure_still_returns_before_extraction(bounded_summary_pipeline):
+    from app.worker import dispatcher as d
+    session, job, archive, settings, service = bounded_summary_pipeline
+    archive.raw_content = "x" * 6000
+    d._run_summarize_job.side_effect = ValueError("synthetic summary failure")
+    await d.dispatch_job(session, job)
+    d._run_summarize_job.assert_awaited_once()
+    d._run_extract_job.assert_not_awaited()
+    service.write_summary.assert_not_awaited()
+    d.fail_job.assert_awaited_once()
+    assert d.fail_job.call_args.kwargs["retryable"] is True
+    session.rollback.assert_awaited_once()
+    session.refresh.assert_awaited_once_with(job)
+    d.complete_job.assert_not_awaited()
+
+
+async def test_bounded_summary_existing_summary_is_not_reprocessed(bounded_summary_pipeline):
+    from app.worker import dispatcher as d
+    session, job, archive, settings, service = bounded_summary_pipeline
+    archive.raw_content = "x" * 6000
+    service.get_existing_summary.return_value = SimpleNamespace(summary_text="Existing summary")
+    await d.dispatch_job(session, job)
+    d._run_summarize_job.assert_not_awaited()
+    service.write_summary.assert_not_awaited()
+    d.complete_job.assert_awaited_once()
