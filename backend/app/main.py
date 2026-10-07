@@ -70,6 +70,7 @@ def _assert_no_keys_in_schema() -> None:
     that could hold a full API key. This enforces the BYOK contract (D-12, Pitfall 5).
 
     Allowed exceptions:
+    - authority_records.authority_key (authority-scope identifier, not a credential)
     - Columns ending in _fingerprint (stores last 4 chars only)
     - Columns ending in _configured (boolean flag)
     - Columns ending in _validation_status (string status)
@@ -93,6 +94,8 @@ def _assert_no_keys_in_schema() -> None:
     violations: list[str] = []
     for table in Base.metadata.tables.values():
         for column in table.columns:
+            if (table.name, column.name) == ("authority_records", "authority_key"):
+                continue
             col_name = column.name.lower()
             for forbidden in forbidden_suffixes:
                 if col_name.endswith(forbidden):
