@@ -48,6 +48,30 @@ _gate = SensitivityGate()
 
 SUMMARIZATION_SYSTEM_PROMPT = """You are a conversation summarizer. Write a concise summary (2-4 sentences) of the key topics and outcomes in this conversation. Focus on information that would be useful to recall in a future session."""
 
+SUMMARY_INPUT_MAX_BYTES = 2048
+_SUMMARY_OMISSION_MARKER = "\n[... {omitted} bytes omitted ...]\n"
+
+
+def _bound_summary_input(text: str) -> tuple[str, bool]:
+    """Keep UTF-8 head/tail slices and an exact omission count within the limit."""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= SUMMARY_INPUT_MAX_BYTES:
+        return text, False
+
+    # The original byte count reserves at least as many marker digits as the
+    # final omitted count. No convergence loop or scan of the omitted middle.
+    marker_budget = len(_SUMMARY_OMISSION_MARKER.format(omitted=len(encoded)).encode("utf-8"))
+    retained_budget = SUMMARY_INPUT_MAX_BYTES - marker_budget
+    head_budget = (retained_budget + 1) // 2
+    tail_budget = retained_budget // 2
+    # Only incomplete code points at the slice boundaries can be discarded:
+    # the source encoding is valid UTF-8, and the two slices do not overlap.
+    head = encoded[:head_budget].decode("utf-8", errors="ignore")
+    tail = encoded[-tail_budget:].decode("utf-8", errors="ignore")
+    omitted = len(encoded) - len(head.encode("utf-8")) - len(tail.encode("utf-8"))
+    return head + _SUMMARY_OMISSION_MARKER.format(omitted=omitted) + tail, True
+
+
 FACT_EXTRACTION_SYSTEM_PROMPT = """You are a fact extraction engine. Extract factual statements from the provided text.
 
 Scan all parts of the text, not just the beginning. Identify all factual claims
@@ -354,7 +378,7 @@ async def _run_summarize_job(text: str, *, allow_external: bool = True) -> str |
 
     # provider == "ollama"
     return await _ollama_chat(
-        SUMMARIZATION_SYSTEM_PROMPT, text, allow_external=allow_external,
+        SUMMARIZATION_SYSTEM_PROMPT, _bound_summary_input(text)[0], allow_external=allow_external,
     )
 
 
@@ -973,6 +997,12 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
                     raw_text, allow_external=effective_policy.allow_external,
                 )
                 if summary_text:
+                    # Reuse the same pure decision without changing the summary
+                    # callable's existing string/None return contract.
+                    summary_input_bounded = (
+                        operation_providers["summarize"] == "ollama"
+                        and _bound_summary_input(raw_text)[1]
+                    )
                     await write_summary(
                         session,
                         raw_archive_id=job.raw_archive_id,
@@ -980,7 +1010,10 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
                         model_used=_resolve_model(
                             operation_providers["summarize"], settings.summarize_model,
                         ),
-                        derivation_method="llm_summarization",
+                        derivation_method=(
+                            "llm_summarization_bounded" if summary_input_bounded
+                            else "llm_summarization"
+                        ),
                     )
                     logger.debug("Wrote summary for job %s", job.id)
             except Exception as e:

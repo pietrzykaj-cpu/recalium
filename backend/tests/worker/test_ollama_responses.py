@@ -1,6 +1,8 @@
 """Regression coverage for Qwen final answers and the extraction envelope."""
 import json
 import logging
+import re
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -288,3 +290,131 @@ async def test_worker_keeps_legacy_reasoning_metadata_tolerance(monkeypatch, set
         assert await d._ollama_chat('system', TEXT, allow_external=False) == 'Final.'
     assert completion_records(caplog)[0].args == {'done_reason': 'stop'}
     assert 'secret' not in caplog.text
+
+
+@pytest.mark.parametrize('size', [2047, 2048])
+def test_summary_bound_keeps_input_at_or_below_limit(size):
+    text = 'x' * size
+    result, bounded = d._bound_summary_input(text)
+    assert d.SUMMARY_INPUT_MAX_BYTES == 2048
+    assert result == text
+    assert result.encode('utf-8') == text.encode('utf-8')
+    assert bounded is False
+
+
+@pytest.mark.parametrize('text', [
+    'H' + 'x' * 2047 + 'T',
+    'HEAD\n' + 'middle ' * 500_000 + '\nTAIL',
+    'Zażółć gęślą jaźń. ' * 200,
+    '漢字中文日本語' * 300,
+    '😀🚀🌍' * 500,
+    'Zażółć 漢字 😀 ' * 300,
+], ids=['max-plus-one', 'several-mb', 'polish', 'cjk', 'emoji', 'mixed'])
+def test_summary_bound_preserves_utf8_edges_and_exact_byte_accounting(text):
+    result, bounded = d._bound_summary_input(text)
+    assert bounded is True
+    assert d._bound_summary_input(text) == (result, True)
+    encoded = result.encode('utf-8')
+    assert encoded.decode('utf-8', errors='strict') == result
+    assert len(encoded) <= d.SUMMARY_INPUT_MAX_BYTES
+    assert '\ufffd' not in result
+    marker = re.search(r'\n\[\.\.\. (\d+) bytes omitted \.\.\.\]\n', result)
+    assert marker is not None
+    head, tail = result[:marker.start()], result[marker.end():]
+    assert head and tail
+    assert text.startswith(head) and text.endswith(tail)
+    omitted = int(marker.group(1))
+    assert omitted > 0
+    assert len(text.encode('utf-8')) == len(head.encode('utf-8')) + omitted + len(tail.encode('utf-8'))
+    assert abs(len(head.encode('utf-8')) - len(tail.encode('utf-8'))) <= 4
+
+
+@pytest.mark.parametrize('text', [TEXT, 'HEAD\n' + 'long text ' * 800 + '\nTAIL'], ids=['small', 'oversize'])
+async def test_summary_request_is_bounded_only_when_needed(
+    monkeypatch, settings, coordinator, caplog, text,
+):
+    client, _ = mock_http(monkeypatch, 'Summary.', metadata={'done_reason': 'stop'})
+    with caplog.at_level(logging.INFO, logger=d.logger.name):
+        assert await d._run_summarize_job(text, allow_external=False) == 'Summary.'
+    client.post.assert_awaited_once()
+    payload = client.post.call_args.kwargs['json']
+    assert payload == {
+        'model': settings.ollama_model,
+        'messages': [
+            {'role': 'system', 'content': d.SUMMARIZATION_SYSTEM_PROMPT},
+            {'role': 'user', 'content': d._bound_summary_input(text)[0]},
+        ],
+        'stream': False, 'think': False, 'keep_alive': '0s',
+        'options': {'temperature': 0, 'num_ctx': 4096},
+    }
+    assert 'num_batch' not in payload['options']
+    assert 'num_ubatch' not in payload['options']
+    if len(text.encode('utf-8')) > d.SUMMARY_INPUT_MAX_BYTES:
+        sent_message = payload['messages'][1]['content']
+        assert sent_message != text
+        assert len(sent_message.encode('utf-8')) <= d.SUMMARY_INPUT_MAX_BYTES
+        assert re.search(r'\n\[\.\.\. \d+ bytes omitted \.\.\.\]\n', sent_message)
+        assert sent_message.startswith('HEAD\n')
+        assert sent_message.endswith('\nTAIL')
+    assert len(coordinator.calls) == 1
+    assert completion_records(caplog)[0].args == {'done_reason': 'stop'}
+    assert text not in caplog.text
+
+
+@pytest.mark.parametrize('provider', ['openai', 'anthropic'])
+async def test_external_summary_receives_full_original_input(monkeypatch, settings, provider):
+    text = 'Zażółć 漢字 😀 ' * 600
+    settings.summarize_provider = provider
+    settings.openai_api_key = settings.anthropic_api_key = 'test-only'
+    create = AsyncMock(return_value=SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='Summary.'))],
+        content=[SimpleNamespace(text='Summary.')],
+    ))
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create)),
+        messages=SimpleNamespace(create=create),
+    )
+    sdk_name = 'AsyncOpenAI' if provider == 'openai' else 'AsyncAnthropic'
+    monkeypatch.setitem(sys.modules, provider, SimpleNamespace(**{sdk_name: lambda **_: client}))
+    monkeypatch.setattr(d, '_bound_summary_input', MagicMock(side_effect=AssertionError('Must not clip')))
+    monkeypatch.setattr(d, '_ollama_chat', AsyncMock(side_effect=AssertionError('No fallback')))
+    assert await d._run_summarize_job(text) == 'Summary.'
+    create.assert_awaited_once()
+    assert create.call_args.kwargs['messages'][-1] == {'role': 'user', 'content': text}
+    d._bound_summary_input.assert_not_called()
+    d._ollama_chat.assert_not_awaited()
+
+
+async def test_summary_clipping_does_not_change_extraction_chunks(monkeypatch, settings):
+    text = 'User: ' + 'Zażółć 漢字 😀 ' * 400 + '\nAssistant: ' + 'tail ' * 500
+    chunks = d._split_conversation(text)
+    client, _ = mock_http(monkeypatch, '{"facts": []}')
+    monkeypatch.setattr(d, '_bound_summary_input', MagicMock(side_effect=AssertionError('Must not clip')))
+    assert await d._run_extract_job(text, allow_external=False) == []
+    users = [call.kwargs['json']['messages'][1]['content'] for call in client.post.call_args_list]
+    assert users == chunks
+    assert ''.join(users) == text
+    assert all('bytes omitted' not in user for user in users)
+    d._bound_summary_input.assert_not_called()
+
+
+async def test_summary_clipping_does_not_change_link_payload(monkeypatch, settings):
+    source, target = 'source ' * 600, 'target ' * 600
+    client, _ = mock_http(monkeypatch, 'supports')
+    monkeypatch.setattr(d, '_bound_summary_input', MagicMock(side_effect=AssertionError('Must not clip')))
+    assert await d._classify_link_pair(source, target) == 'supports'
+    client.post.assert_awaited_once()
+    assert client.post.call_args.kwargs['json']['messages'][1]['content'] == (
+        f'Fact A: {source}\nFact B: {target}\n\n'
+        'How does Fact B relate to Fact A? '
+        'Reply with exactly one word: supports, elaborates, contradicts, or unrelated.'
+    )
+    d._bound_summary_input.assert_not_called()
+
+
+async def test_bounded_summary_http_failure_has_no_retry_or_fallback(monkeypatch, settings, coordinator):
+    client, _ = mock_http(monkeypatch, '', status=503)
+    with pytest.raises(httpx.HTTPStatusError):
+        await d._run_summarize_job('x' * 6000, allow_external=False)
+    client.post.assert_awaited_once()
+    assert len(coordinator.calls) == 1
