@@ -266,7 +266,10 @@ async def _ollama_chat(
         ],
         "stream": False,
         "think": False,
-        "options": {"temperature": 0},
+        "options": {
+            "temperature": 0,
+            "num_ctx": 4096,
+        },
     }
     if local_endpoint:
         payload["keep_alive"] = "0s"
