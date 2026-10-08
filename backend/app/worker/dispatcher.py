@@ -267,8 +267,60 @@ def _parse_ollama_facts(raw: str) -> list[dict[str, Any]]:
     return [fact.model_dump() for fact in result.facts]
 
 
+_SUMMARY_OUTPUT_FAILURE = object()
+
+
+def _mark_summary_output_failure(exc: Exception, category: str) -> None:
+    """Mark only failures caught at a summary provider request/parse boundary.
+
+    Keep the original exception type/return contract. In particular, coordinator
+    probes may raise the same HTTP classes and must NEVER qualify by class alone.
+    """
+    setattr(exc, "_summary_output_failure", (_SUMMARY_OUTPUT_FAILURE, category))
+
+
+def _summary_failure_category(exc: Exception) -> str | None:
+    marker = getattr(exc, "_summary_output_failure", None)
+    if (isinstance(marker, tuple) and len(marker) == 2
+            and marker[0] is _SUMMARY_OUTPUT_FAILURE
+            and marker[1] in ("provider_transport", "provider_response", "response_parsing")):
+        return marker[1]
+    return None
+
+
+def _eligible_summary_http_status(status: object) -> bool:
+    return type(status) is int and (status in (408, 429) or 500 <= status <= 599)
+
+
+def _mark_summary_sdk_failure(exc: Exception, sdk: Any) -> None:
+    """Recognize only the SDK's documented request/response error classes."""
+    for name, category in (
+        ("APIConnectionError", "provider_transport"),
+        ("APIStatusError", "provider_response"),
+        ("APIResponseValidationError", "response_parsing"),
+    ):
+        error_class = getattr(sdk, name, None)
+        if isinstance(error_class, type) and isinstance(exc, error_class):
+            if name == "APIStatusError":
+                status = getattr(exc, "status_code", None)
+                if not _eligible_summary_http_status(status):
+                    return
+            _mark_summary_output_failure(exc, category)
+            return
+
+
+def _bounded_exception_class(exc: Exception) -> str:
+    name = type(exc).__name__
+    return name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) else "Exception"
+
+
+def _stage_failure(stage: str, category: str, exc: Exception) -> str:
+    return f"{stage}_failed(category={category}, exception_class={_bounded_exception_class(exc)})"
+
+
 async def _ollama_chat(
     system: str, user: str, *, format_json: bool = False, allow_external: bool = True,
+    _summary_request: bool = False,
 ) -> str:
     """Call Ollama's native API and return only its final answer.
 
@@ -312,18 +364,43 @@ async def _ollama_chat(
             follow_redirects=False,
             trust_env=allow_external and not local_endpoint,
         ) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            resp.raise_for_status()
-            response_payload = resp.json()
+            try:
+                resp = await client.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if _summary_request and _eligible_summary_http_status(exc.response.status_code):
+                    _mark_summary_output_failure(exc, "provider_response")
+                raise
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+                if _summary_request:
+                    _mark_summary_output_failure(exc, "provider_transport")
+                raise
+            try:
+                response_payload = resp.json()
+            except json.JSONDecodeError as exc:
+                if _summary_request:
+                    _mark_summary_output_failure(exc, "response_parsing")
+                raise
             diagnostics = parse_ollama_completion_diagnostics(response_payload)
             if diagnostics is not None:
                 fields = diagnostics.model_dump(exclude_none=True)
                 if fields:
                     # Observe only shared-policy metadata, even if content parsing fails.
                     logger.info("Ollama completion diagnostics: %s", fields)
-            return _ollama_final_content(
-                response_payload.get("message", {}).get("content") or ""
-            )
+            if _summary_request:
+                # Validate only the summary envelope, not diagnostics or internal
+                # helpers: unexpected internal failures remain unclassified.
+                try:
+                    if not isinstance(response_payload, dict):
+                        raise ValueError("Invalid summary response envelope")
+                    message = response_payload.get("message")
+                    if not isinstance(message, dict) or not isinstance(message.get("content"), str):
+                        raise ValueError("Invalid summary response content")
+                    return _ollama_final_content(message["content"])
+                except ValueError as exc:
+                    _mark_summary_output_failure(exc, "response_parsing")
+                    raise
+            return _ollama_final_content(response_payload.get("message", {}).get("content") or "")
 
     if not local_endpoint:
         return await send_once()
@@ -353,32 +430,57 @@ async def _run_summarize_job(text: str, *, allow_external: bool = True) -> str |
     if provider == "openai":
         from openai import AsyncOpenAI  # noqa: PLC0415
         client = AsyncOpenAI(api_key=settings.openai_api_key)
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": SUMMARIZATION_SYSTEM_PROMPT},
-                {"role": "user", "content": text},
-            ],
-            temperature=0,
-            max_tokens=512,
-        )
-        return response.choices[0].message.content
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": SUMMARIZATION_SYSTEM_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0,
+                max_tokens=512,
+            )
+        except Exception as exc:
+            import openai as sdk  # noqa: PLC0415
+            _mark_summary_sdk_failure(exc, sdk)
+            raise
+        try:
+            content = response.choices[0].message.content
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("No summary content")
+            return content
+        except (AttributeError, IndexError, ValueError) as exc:
+            _mark_summary_output_failure(exc, "response_parsing")
+            raise
 
     if provider == "anthropic":
         from anthropic import AsyncAnthropic  # noqa: PLC0415
         client = AsyncAnthropic(api_key=settings.anthropic_api_key)
-        response = await client.messages.create(
-            model=model,
-            max_tokens=512,
-            temperature=0,
-            messages=[{"role": "user", "content": text}],
-            system=SUMMARIZATION_SYSTEM_PROMPT,
-        )
-        return response.content[0].text
+        try:
+            response = await client.messages.create(
+                model=model,
+                max_tokens=512,
+                temperature=0,
+                messages=[{"role": "user", "content": text}],
+                system=SUMMARIZATION_SYSTEM_PROMPT,
+            )
+        except Exception as exc:
+            import anthropic as sdk  # noqa: PLC0415
+            _mark_summary_sdk_failure(exc, sdk)
+            raise
+        try:
+            content = response.content[0].text
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError("No summary content")
+            return content
+        except (AttributeError, IndexError, ValueError) as exc:
+            _mark_summary_output_failure(exc, "response_parsing")
+            raise
 
     # provider == "ollama"
     return await _ollama_chat(
         SUMMARIZATION_SYSTEM_PROMPT, _bound_summary_input(text)[0], allow_external=allow_external,
+        _summary_request=True,
     )
 
 
@@ -820,7 +922,8 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
       4. FTS indexing (always runs — local, no external call)
       5. Embeddings and conflict detection wired in plan 05–06
 
-    On any provider error: job → retryable_failed with error captured (BYOK-07).
+    Summary output failures retry until the final attempt, then extraction may
+    continue only after a durable bounded audit. Persistence/safety failures stop.
     On missing provider: job → pending_provider (amber badge, not failure).
     On blocked content: job → completed (no LLM output, FTS still runs).
     """
@@ -833,6 +936,8 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
         write_tags,
         get_existing_summary,
     )
+
+    summary_failure: str | None = None
 
     # ── Step 1: Load raw archive content ────────────────────────────────────
     result = await session.execute(
@@ -992,10 +1097,12 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
         existing_summary = await get_existing_summary(session, job.raw_archive_id)
 
         if existing_summary is None and operation_permissions["summarize"]["allowed"]:
+            summary_obtained = False
             try:
                 summary_text = await _run_summarize_job(
                     raw_text, allow_external=effective_policy.allow_external,
                 )
+                summary_obtained = True
                 if summary_text:
                     # Reuse the same pure decision without changing the summary
                     # callable's existing string/None return contract.
@@ -1017,15 +1124,42 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
                     )
                     logger.debug("Wrote summary for job %s", job.id)
             except Exception as e:
-                error_type = type(e).__name__
+                # write_summary commits before refresh: once the provider returned,
+                # no persistence/refresh exception may authorize fallthrough.
+                category = None if summary_obtained else _summary_failure_category(e)
+                failure = _stage_failure("summary", category or "unclassified", e)
                 await session.rollback()  # clear any aborted tx so the status write succeeds
                 await session.refresh(job)  # rollback expired the instance
-                await fail_job(
-                    session, job,
-                    error=f"{error_type}: {str(e)[:500]}",
-                    retryable=True,
-                )
-                return
+                if category is None or job.attempts < job.max_attempts:
+                    await fail_job(session, job, error=failure, retryable=True)
+                    return
+                summary_failure = failure  # survives later rollback/refresh
+                try:
+                    from app.domain.audit.models import AuditEvent  # noqa: PLC0415
+                    provider = operation_providers["summarize"]
+                    session.add(AuditEvent(
+                        event_type="summary_failed",
+                        raw_archive_id=job.raw_archive_id,
+                        actor="pipeline_worker",
+                        operation_metadata={
+                            "job_id": str(job.id), "stage": "summary",
+                            "attempt": job.attempts, "max_attempts": job.max_attempts,
+                            "final_attempt": True, "failure_category": category,
+                            "exception_class": _bounded_exception_class(e),
+                            "provider": provider if provider in ("ollama", "openai", "anthropic") else None,
+                            "continuing_to_extraction": True,
+                        },
+                    ))
+                    await session.commit()
+                except Exception as audit_exc:
+                    await session.rollback()
+                    await session.refresh(job)
+                    await fail_job(
+                        session, job,
+                        error=f"{failure}; {_stage_failure('audit', 'persistence', audit_exc)}",
+                        retryable=False,
+                    )
+                    return
 
         # Extract facts
         try:
@@ -1066,8 +1200,11 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
             await session.refresh(job)  # rollback expired the instance
             await fail_job(
                 session, job,
-                error=f"{error_type}: {str(e)[:500]}",
-                retryable=True,
+                error=(
+                    f"{summary_failure}; {_stage_failure('extraction', 'failure', e)}"
+                    if summary_failure else f"{error_type}: {str(e)[:500]}"
+                ),
+                retryable=summary_failure is None,
             )
             return
 
@@ -1198,5 +1335,6 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
         await session.rollback()
         await session.refresh(job)
 
+    job.error_message = f"partial: {summary_failure}" if summary_failure else None
     await complete_job(session, job)
     logger.info("Completed job %s", job.id)
