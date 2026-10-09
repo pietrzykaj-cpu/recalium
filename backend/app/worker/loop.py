@@ -28,7 +28,11 @@ async def worker_loop() -> None:
     Cancelled cleanly on shutdown via task.cancel() + await task.
     """
     from app.infrastructure.db import get_session_factory
-    from app.domain.jobs.service import claim_next_job, reset_stale_jobs
+    from app.domain.jobs.service import (
+        claim_next_job,
+        recover_claimed_job_after_dispatch_failure,
+        reset_stale_jobs,
+    )
 
     sem = asyncio.Semaphore(_MAX_CONCURRENT)
 
@@ -55,9 +59,29 @@ async def worker_loop() -> None:
                     if job is not None:
                         logger.info("Processing job %s (type=%s)", job.id, job.job_type)
 
-                        # Dispatch job through pipeline — import here to avoid circular imports
-                        from app.worker.dispatcher import dispatch_job  # noqa: PLC0415
-                        await dispatch_job(session, job)
+                        # Save scalar ownership evidence before rollback can expire the Job.
+                        fingerprint = (job.id, job.attempts, job.claimed_at)
+                        try:
+                            # Import is part of dispatch, not post-completion bookkeeping.
+                            from app.worker.dispatcher import dispatch_job  # noqa: PLC0415
+                            await dispatch_job(session, job)
+                        except Exception as exc:
+                            logger.exception("Unexpected dispatch failure for job %s", fingerprint[0])
+                            try:
+                                outcome = await recover_claimed_job_after_dispatch_failure(
+                                    session, *fingerprint, exc
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Claimed-job recovery failed for job %s", fingerprint[0]
+                                )
+                                raise
+                            if outcome != "recovered":
+                                logger.warning(
+                                    "Claimed-job recovery skipped for job %s (%s)",
+                                    fingerprint[0], outcome,
+                                )
+                            raise  # existing outer handler closes session and backs off for 5s
 
                         # F8: memory changed — invalidate retrieval caches (event-driven)
                         from app.domain.retrieval.service import notify_cache_invalidation  # noqa: PLC0415

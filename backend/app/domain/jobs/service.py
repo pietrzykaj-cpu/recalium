@@ -6,8 +6,10 @@ SECURITY: Never reads or stores API keys — keys are read from settings at disp
 from __future__ import annotations
 
 import logging
+import re
 import uuid
 from datetime import datetime, timezone, timedelta
+from typing import Literal
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -88,6 +90,37 @@ async def fail_job(
         "Job %s failed (status=%s, attempts=%d/%d): %s",
         job.id, job.status, job.attempts, job.max_attempts, error[:200],
     )
+
+
+async def recover_claimed_job_after_dispatch_failure(
+    session: AsyncSession,
+    job_id: uuid.UUID,
+    attempts: int,
+    claimed_at: datetime | None,
+    exc: Exception,
+) -> Literal["recovered", "missing", "claim_mismatch"]:
+    """Fail only the escaped dispatch's claim; preserve its consumed attempt."""
+    await session.rollback()
+    result = await session.execute(
+        select(Job)
+        .where(Job.id == job_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    job = result.scalar_one_or_none()
+    if job is None:
+        await session.rollback()
+        return "missing"
+    if job.status != "claimed" or job.attempts != attempts or job.claimed_at != claimed_at:
+        await session.rollback()
+        return "claim_mismatch"
+
+    # Match the dispatcher's bounded class convention without importing the
+    # worker here: recovery must also work when the dispatcher import failed.
+    name = type(exc).__name__
+    name = name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", name) else "Exception"
+    await fail_job(session, job, error=f"worker_dispatch_unhandled:{name}", retryable=True)
+    return "recovered"
 
 
 async def set_pending_provider(session: AsyncSession, job: Job, reason: str) -> None:
