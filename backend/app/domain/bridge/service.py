@@ -48,7 +48,7 @@ from app.domain.context_packets.service import build_context_packet
 from app.domain.derived_memory.models import Fact, Summary
 from app.domain.ingest.service import ingest_text_content
 from app.domain.jobs.models import Job
-from app.domain.model_context.encoding import encode_label, render_body_lines
+from app.domain.model_context.encoding import BODY_GUTTER, encode_label, render_body_lines
 from app.domain.retrieval.diagnostics import RetrievalDiagnostics
 from app.domain.retrieval.service import (
     RetrievalFilters,
@@ -517,6 +517,40 @@ def _authority_lines(authority_results, *, include_historical):
     return lines
 
 
+def _surviving_rendered_memory_ids(packet, base_text, surviving_chars):
+    """Match complete encoded blocks, then check their final character offsets.
+
+    Encoded labels stay on one line and semantic bodies are guttered, so
+    untrusted text cannot manufacture a column-zero memory header. Matching
+    the entire generated block also rejects clipped bodies/codec sequences.
+    """
+    blocks = {
+        "\n".join([
+            f"- [verbatim inherited evidence; memory={encode_label(item.memory_id)}; "
+            f"archive={encode_label(item.source.archive_id)}; "
+            f"rank={item.retrieval.relevance_rank}]",
+            *render_body_lines(item.content),
+        ]): item.memory_id
+        for item in packet.selected
+    }
+    included = []
+    lines = base_text.split("\n")
+    index = offset = 0
+    while index < len(lines):
+        end = index + 1
+        if lines[index].startswith("- [verbatim inherited evidence; memory="):
+            while end < len(lines) and (
+                lines[end] == BODY_GUTTER or lines[end].startswith(f"{BODY_GUTTER} ")
+            ):
+                end += 1
+        block = "\n".join(lines[index:end])
+        if block in blocks and offset + len(block) <= surviving_chars:
+            included.append(blocks[block])
+        offset += len(block) + 1
+        index = end
+    return included
+
+
 async def _continuity_handoff(session, actor, req: ContinuityHandoffInput, spaces):
     """Assemble an authorized, transient continuity handoff without persistence or providers."""
     if req.space_id not in spaces:
@@ -575,12 +609,21 @@ async def _continuity_handoff(session, actor, req: ContinuityHandoffInput, space
         rendered_base.text,
     ])
     rendered_text = "\n".join(lines)
+    prefix_chars = len(rendered_text) - len(rendered_base.text)
     if len(rendered_text) > req.render_max_chars:
         rendered_text = rendered_text[:req.render_max_chars].rstrip()
+    included = _surviving_rendered_memory_ids(
+        packet, rendered_base.text, len(rendered_text) - prefix_chars,
+    )
     rendered = rendered_base.model_copy(update={
         "text": rendered_text,
         "max_chars": req.render_max_chars,
         "truncated": rendered_base.truncated or len(rendered_text) < len("\n".join(lines)),
+        "included_memory_ids": included,
+        "omitted_memory_count": (
+            rendered_base.omitted_memory_count
+            + len(rendered_base.included_memory_ids) - len(included)
+        ),
     })
     warnings = []
     for result in authority_results:
