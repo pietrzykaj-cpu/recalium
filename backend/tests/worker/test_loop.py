@@ -126,6 +126,7 @@ async def test_stale_claimed_jobs_reset_on_startup(db_session_phase2):
     await db_session_phase2.refresh(stale_job)
 
     assert stale_job.status == "pending"
+    assert stale_job.attempts == 0
 
 
 async def test_worker_loop_persists_status_transitions(db_session_phase2, monkeypatch):
@@ -188,3 +189,92 @@ async def test_worker_loop_persists_status_transitions(db_session_phase2, monkey
         f"Job status in DB is {status!r} after dispatch — status transition "
         "was not persisted (claim and dispatch must share one session)"
     )
+
+
+@pytest.mark.parametrize("mode", ["dispatch", "recovery_db", "success", "cache", "cancel", "system_exit", "import"])
+async def test_dispatch_recovery_boundary_and_next_poll(db_session_phase2, test_engine, monkeypatch, caplog, mode):
+    import asyncio
+    import builtins
+    from unittest.mock import AsyncMock
+    from sqlalchemy import select
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.domain.jobs.models import Job
+    from app.domain.jobs import service
+    from app.infrastructure import db
+    from app.worker import dispatcher
+    from app.domain.retrieval import service as retrieval
+
+    session = db_session_phase2
+    archive = await _make_archive_item(session)
+    first = Job(id=uuid.uuid4(), job_type="process_archive_item", raw_archive_id=archive.id,
+                status="pending", max_attempts=3)
+    second = Job(id=uuid.uuid4(), job_type="process_archive_item", raw_archive_id=archive.id,
+                 status="pending")
+    session.add_all([first, second])
+    await session.commit()
+    ids = (first.id, second.id)
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    monkeypatch.setattr(db, "get_session_factory", lambda: factory)
+    reset = AsyncMock(wraps=service.reset_stale_jobs)
+    recovery = AsyncMock(wraps=service.recover_claimed_job_after_dispatch_failure)
+    if mode == "recovery_db":
+        recovery.side_effect = RuntimeError("synthetic recovery DB failure")
+    monkeypatch.setattr(service, "reset_stale_jobs", reset)
+    monkeypatch.setattr(service, "recover_claimed_job_after_dispatch_failure", recovery)
+    calls, sleeps = [], []
+
+    async def dispatch(active, claimed):
+        calls.append(claimed.id)
+        if len(calls) == 1:
+            if mode in {"dispatch", "recovery_db"}:
+                raise ValueError("PRIVATE-CANARY" * 1000)
+            if mode == "cancel":
+                raise asyncio.CancelledError()
+            if mode == "system_exit":
+                raise SystemExit(7)
+        await service.complete_job(active, claimed)
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        if mode != "dispatch" or seconds == 2:
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(dispatcher, "dispatch_job", dispatch)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    invalidate = AsyncMock()
+    if mode == "cache":
+        invalidate.side_effect = RuntimeError("synthetic cache failure")
+    monkeypatch.setattr(retrieval, "notify_cache_invalidation", invalidate)
+    if mode == "import":
+        original_import = builtins.__import__
+        def fail_dispatch_import(name, *args, **kwargs):
+            if name == "app.worker.dispatcher":
+                raise ImportError("synthetic import failure")
+            return original_import(name, *args, **kwargs)
+        monkeypatch.setattr(builtins, "__import__", fail_dispatch_import)
+
+    with pytest.raises(SystemExit if mode == "system_exit" else asyncio.CancelledError):
+        await worker_loop()
+    reset.assert_awaited_once()
+    if mode in {"dispatch", "recovery_db", "import"}:
+        recovery.assert_awaited_once()
+        assert sleeps[0] == 5
+    else:
+        recovery.assert_not_awaited()
+    async with factory() as observer:
+        saved = (await observer.execute(select(Job).where(Job.id == ids[0]))).scalar_one()
+        if mode == "dispatch":
+            assert calls == [ids[0], ids[0], ids[1]]
+            assert saved.status == "completed" and saved.attempts == 2
+            assert saved.error_message == "worker_dispatch_unhandled:ValueError"
+            assert invalidate.await_count == 2
+        elif mode in {"success", "cache"}:
+            assert saved.status == "completed"
+            assert invalidate.await_count >= 1
+        elif mode == "import":
+            assert saved.status == "retryable_failed" and saved.attempts == 1
+            assert saved.error_message == "worker_dispatch_unhandled:ImportError"
+        else:
+            assert saved.status == "claimed" and saved.attempts == 1
+            if mode == "recovery_db":
+                assert "Claimed-job recovery failed" in caplog.text
