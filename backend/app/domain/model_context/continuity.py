@@ -541,6 +541,30 @@ def _mandatory_lines(
             else "not declared"
         )
     )
+    if agent.annotations:
+        lines.extend(
+            [
+                "SUCCESSOR ANNOTATIONS — NON-AUTHORITATIVE",
+                "Supplied current-agent qualifications; do not rewrite inherited evidence "
+                "or current authority.",
+            ]
+        )
+        for annotation in agent.annotations:
+            targets = [
+                f"{name}={encode_label(value)}"
+                for name, value in (
+                    ("target_predecessor_id", annotation.target_predecessor_id),
+                    ("target_record_id", annotation.target_record_id),
+                )
+                if value is not None
+            ]
+            target_labels = "; ".join(targets) or "target=not specified"
+            body = render_body_lines(annotation.rationale)
+            lines.append(
+                f"- kind={encode_label(annotation.kind)}; {target_labels}; "
+                f"rationale_lines={len(body)}:"
+            )
+            lines.extend(body)
     if questions:
         lines.append("UNRESOLVED QUESTIONS")
         lines.extend(f"- {encode_prose(question)}" for question in questions)
