@@ -100,7 +100,8 @@ async def test_terminal_failure_when_max_attempts_reached(db_session_phase2):
     assert job.attempts >= job.max_attempts
 
 
-async def test_reprocess_resets_job_to_pending(db_session_phase2):
+@pytest.mark.parametrize("status", ["failed", "retryable_failed", "pending_provider"])
+async def test_reprocess_resets_job_to_pending(db_session_phase2, status):
     """PIPE-05: reprocess_job resets a failed job back to pending for re-queue."""
     from app.domain.jobs.models import Job
     archive_item = await _make_archive_item(db_session_phase2)
@@ -108,7 +109,7 @@ async def test_reprocess_resets_job_to_pending(db_session_phase2):
         id=uuid.uuid4(),
         job_type="process_archive_item",
         raw_archive_id=archive_item.id,
-        status="failed",
+        status=status,
         attempts=3,
         max_attempts=3,
         error_message="Some old error",
@@ -116,12 +117,197 @@ async def test_reprocess_resets_job_to_pending(db_session_phase2):
     db_session_phase2.add(job)
     await db_session_phase2.commit()
 
-    await reprocess_job(db_session_phase2, job.id)
+    before = dict((await db_session_phase2.execute(Job.__table__.select())).mappings().one())
+    result = await reprocess_job(db_session_phase2, job.id)
     await db_session_phase2.refresh(job)
 
     assert job.status == "pending"
     assert job.attempts == 0
     assert job.error_message is None
+    assert result is job
+    after = dict((await db_session_phase2.execute(Job.__table__.select())).mappings().one())
+    for key in before.keys() - {"status", "attempts", "error_message", "updated_at"}:
+        assert after[key] == before[key]
+    assert after["updated_at"] >= before["updated_at"]
+
+
+@pytest.mark.parametrize("status", ["claimed", "completed", "pending", "terminal_failed", "unsupported"])
+async def test_reprocess_rejects_without_changing_row(db_session_phase2, status):
+    from datetime import datetime, timezone
+    from app.domain.jobs.models import Job
+    from app.domain.jobs import service
+
+    session = db_session_phase2
+    archive = await _make_archive_item(session)
+    job = Job(id=uuid.uuid4(), job_type="process_archive_item", raw_archive_id=archive.id,
+              status=status, attempts=2, max_attempts=5, error_message="Preserve error",
+              claimed_at=datetime.now(timezone.utc), completed_at=datetime.now(timezone.utc))
+    session.add(job)
+    await session.commit()
+    job_id = job.id
+    before = dict((await session.execute(Job.__table__.select())).mappings().one())
+    with pytest.raises(service.ReprocessConflict):
+        await service.reprocess_job(session, job_id)
+    assert not session.in_transaction()  # rejection releases the validation lock
+    after = dict((await session.execute(Job.__table__.select())).mappings().one())
+    assert after == before
+
+
+async def test_reprocess_missing_releases_transaction(db_session_phase2):
+    assert await reprocess_job(db_session_phase2, uuid.uuid4()) is None
+    assert not db_session_phase2.in_transaction()
+
+
+@pytest.mark.parametrize("dirty", [False, True])
+async def test_reprocess_validates_fresh_state_not_cached_or_dirty_status(db_session_phase2, test_engine, dirty):
+    from sqlalchemy import update
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.domain.jobs.models import Job
+    from app.domain.jobs import service
+
+    session = db_session_phase2
+    archive = await _make_archive_item(session)
+    job = Job(id=uuid.uuid4(), job_type="process_archive_item", raw_archive_id=archive.id,
+              status="failed", attempts=2, error_message="Preserve error")
+    session.add(job)
+    await session.commit()
+    job_id = job.id
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as worker:
+        await worker.execute(update(Job).where(Job.id == job_id).values(status="claimed"))
+        await worker.commit()
+        before = dict((await worker.execute(Job.__table__.select())).mappings().one())
+    assert job.status == "failed"  # stale cached state still permits reprocess
+    if dirty:
+        job.status = "pending_provider"  # must not autoflush before the locked read
+    with pytest.raises(service.ReprocessConflict):
+        await service.reprocess_job(session, job_id)
+    async with factory() as observer:
+        after = dict((await observer.execute(Job.__table__.select())).mappings().one())
+        assert after == before
+
+
+async def test_reprocess_holds_row_lock_through_validation_and_reset(db_session_phase2, test_engine, monkeypatch):
+    from sqlalchemy import select
+    from sqlalchemy.exc import DBAPIError
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.domain.jobs.models import Job
+
+    session = db_session_phase2
+    archive = await _make_archive_item(session)
+    job = Job(id=uuid.uuid4(), job_type="process_archive_item", raw_archive_id=archive.id,
+              status="failed", attempts=3)
+    session.add(job)
+    await session.commit()
+    job_id = job.id
+    execute = session.execute
+    locked_reads = []
+
+    async def inspect_locked_read(statement, *args, **kwargs):
+        result = await execute(statement, *args, **kwargs)
+        assert statement._for_update_arg is not None
+        assert statement.get_execution_options()["populate_existing"] is True
+        assert statement.get_execution_options()["autoflush"] is False
+        async with async_sessionmaker(test_engine)() as competitor:
+            with pytest.raises(DBAPIError) as blocked:
+                await competitor.execute(select(Job).where(Job.id == job_id).with_for_update(nowait=True))
+            assert blocked.value.orig.sqlstate == "55P03"
+            await competitor.rollback()
+        locked_reads.append(True)
+        return result
+
+    monkeypatch.setattr(session, "execute", inspect_locked_read)
+    reset = await reprocess_job(session, job_id)
+    assert reset.status == "pending" and reset.attempts == 0
+    assert locked_reads == [True]
+    assert not session.in_transaction()
+
+
+async def test_reprocess_waiting_on_worker_claim_cannot_requeue_inflight_job(db_session_phase2, test_engine, monkeypatch):
+    """Observe a real PostgreSQL lock wait; no wall-clock sleep controls the race."""
+    import asyncio
+    from sqlalchemy import select, text
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.domain.jobs.models import Job
+    from app.domain.jobs import service
+
+    seed = db_session_phase2
+    archive = await _make_archive_item(seed)
+    job = Job(id=uuid.uuid4(), job_type="process_archive_item", raw_archive_id=archive.id,
+              status="retryable_failed", attempts=1, error_message="Prior failure")
+    seed.add(job)
+    await seed.commit()
+    job_id = job.id
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as worker, factory() as requester:
+        cached = await requester.get(Job, job_id)
+        requester_pid = (await requester.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+        flushed, release = asyncio.Event(), asyncio.Event()
+        commit = worker.commit
+
+        async def hold_claim_before_commit():
+            await worker.flush()
+            flushed.set()
+            await release.wait()
+            await commit()
+
+        monkeypatch.setattr(worker, "commit", hold_claim_before_commit)
+        claiming = asyncio.create_task(service.claim_next_job(worker))
+        requeue = None
+        try:
+            await asyncio.wait_for(flushed.wait(), timeout=5)
+            worker_pid = (await worker.execute(text("SELECT pg_backend_pid()"))).scalar_one()
+            assert cached.status == "retryable_failed"
+            requeue = asyncio.create_task(service.reprocess_job(requester, job_id))
+            async with asyncio.timeout(5):
+                while True:
+                    blockers = (await worker.execute(
+                        text("SELECT pg_blocking_pids(:pid)"), {"pid": requester_pid}
+                    )).scalar_one()
+                    if worker_pid in blockers:
+                        break
+                    assert not requeue.done(), "Reprocess did not wait for the worker's row lock"
+                    await asyncio.sleep(0)  # scheduling yield, not a timing assumption
+            before = dict((await worker.execute(Job.__table__.select())).mappings().one())
+            assert before["status"] == "claimed" and before["attempts"] == 2
+            release.set()
+            claimed = await asyncio.wait_for(claiming, timeout=5)
+            assert claimed.id == job_id
+            with pytest.raises(service.ReprocessConflict):
+                await asyncio.wait_for(requeue, timeout=5)
+            assert not requester.in_transaction()
+            after = dict((await requester.execute(Job.__table__.select())).mappings().one())
+            assert after == before
+            assert await service.claim_next_job(requester) is None
+        finally:
+            release.set()
+            for task in (claiming, requeue):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(*(t for t in (claiming, requeue) if t is not None), return_exceptions=True)
+
+
+async def test_concurrent_manual_reprocess_cannot_reset_twice(db_session_phase2, test_engine):
+    import asyncio
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+    from app.domain.jobs.models import Job
+    from app.domain.jobs import service
+
+    seed = db_session_phase2
+    archive = await _make_archive_item(seed)
+    job = Job(id=uuid.uuid4(), job_type="process_archive_item", raw_archive_id=archive.id,
+              status="failed", attempts=3)
+    seed.add(job)
+    await seed.commit()
+    job_id = job.id
+    factory = async_sessionmaker(test_engine, expire_on_commit=False)
+    async with factory() as first, factory() as second:
+        results = await asyncio.wait_for(asyncio.gather(
+            service.reprocess_job(first, job_id), service.reprocess_job(second, job_id),
+            return_exceptions=True,
+        ), timeout=5)
+        assert sum(isinstance(result, Job) for result in results) == 1
+        assert sum(isinstance(result, service.ReprocessConflict) for result in results) == 1
 
 
 @pytest.mark.parametrize("attempt", [1, 2, 3])
