@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 _STALE_THRESHOLD_MINUTES = 10
 
 
+class ReprocessConflict(Exception):
+    """The job's locked current status does not allow manual reprocessing."""
+
+
 async def claim_next_job(session: AsyncSession) -> Job | None:
     """Atomically claim the next available job using SKIP LOCKED.
 
@@ -163,15 +167,26 @@ async def reset_stale_jobs(session: AsyncSession) -> int:
 
 
 async def reprocess_job(session: AsyncSession, job_id: uuid.UUID) -> Job | None:
-    """Reset a failed/terminal job back to pending for manual re-queue.
+    """Reset a failed, retryable_failed, or pending_provider job for manual re-queue.
 
     PIPE-05: Used by POST /api/jobs/{job_id}/reprocess endpoint.
     Resets attempts to 0 so it gets full max_attempts retries.
+    Reject all other statuses without mutation, particularly an in-flight claim.
+    Revisit completed jobs only once Slice 1 can create a new derivation generation.
     """
-    result = await session.execute(select(Job).where(Job.id == job_id))
+    result = await session.execute(
+        select(Job)
+        .where(Job.id == job_id)
+        .with_for_update()
+        .execution_options(populate_existing=True, autoflush=False)
+    )
     job = result.scalar_one_or_none()
     if job is None:
+        await session.rollback()
         return None
+    if job.status not in {"failed", "retryable_failed", "pending_provider"}:
+        await session.rollback()
+        raise ReprocessConflict("Job cannot be reprocessed in its current state")
 
     job.status = "pending"
     job.attempts = 0

@@ -7,6 +7,8 @@ from __future__ import annotations
 import hashlib
 import uuid
 
+import pytest
+
 
 async def _make_archive_item(session):
     """Helper: insert a minimal RawArchiveItem to satisfy FK constraint on jobs."""
@@ -23,7 +25,8 @@ async def _make_archive_item(session):
     return item
 
 
-async def test_reprocess_endpoint_returns_200(client, db_session):
+@pytest.mark.parametrize("status", ["failed", "retryable_failed", "pending_provider"])
+async def test_reprocess_endpoint_returns_200(client, db_session, status):
     """PIPE-05: POST /api/jobs/{job_id}/reprocess resets a failed job to pending."""
     from app.domain.jobs.models import Job
 
@@ -32,7 +35,7 @@ async def test_reprocess_endpoint_returns_200(client, db_session):
         id=uuid.uuid4(),
         job_type="process_archive_item",
         raw_archive_id=archive_item.id,
-        status="failed",
+        status=status,
         attempts=3,
         max_attempts=3,
         error_message="Old error",
@@ -46,6 +49,29 @@ async def test_reprocess_endpoint_returns_200(client, db_session):
     data = response.json()
     assert data["status"] == "pending"
     assert data["job_id"] == str(job.id)
+    await db_session.refresh(job)
+    assert job.attempts == 0 and job.error_message is None
+    assert job.max_attempts == 3 and job.raw_archive_id == archive_item.id
+
+
+@pytest.mark.parametrize("status", ["claimed", "completed", "pending", "terminal_failed", "unsupported"])
+async def test_reprocess_conflict_preserves_entire_row(client, db_session, status):
+    from datetime import datetime, timezone
+    from app.domain.jobs.models import Job
+
+    archive = await _make_archive_item(db_session)
+    job = Job(id=uuid.uuid4(), job_type="process_archive_item", raw_archive_id=archive.id,
+              status=status, attempts=2, max_attempts=5, error_message="PRIVATE-OLD-ERROR",
+              claimed_at=datetime.now(timezone.utc), completed_at=datetime.now(timezone.utc))
+    db_session.add(job)
+    await db_session.commit()
+    job_id = job.id
+    before = dict((await db_session.execute(Job.__table__.select())).mappings().one())
+    response = await client.post(f"/api/jobs/{job_id}/reprocess")
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Job cannot be reprocessed in its current state"}
+    after = dict((await db_session.execute(Job.__table__.select())).mappings().one())
+    assert after == before
 
 
 async def test_reprocess_unknown_job_returns_404(client):
