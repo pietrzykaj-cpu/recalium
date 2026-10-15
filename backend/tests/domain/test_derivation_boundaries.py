@@ -11,11 +11,11 @@ from app.domain.derivations import service as g
 from app.domain.derivations.models import DerivationGeneration as Gen, ArchiveDerivationHead as Head, DerivationFtsProjection as Fts
 from app.domain.derived_memory.models import Fact
 from app.domain.derivations.visibility import HISTORY
-from tests.domain.test_derivation_generations import claimed, managed
+from tests.domain.test_derivation_generations import admit_claimed, claimed, managed
 
 async def build(session, job, content='alpha managed', publish=True):
     jid, aid, attempt, at = job.id, job.raw_archive_id, job.attempts, job.claimed_at
-    gen = await g.admit_generation(session, jid)
+    gen = await admit_claimed(session, jid)
     claim = g.Claim(jid, aid, gen.id, attempt, at)
     await g.persist_summary(session, claim, content)
     facts = await g.persist_extraction(session, claim, [{'fact_text':content,'tags':['visible'],'entities':['Anna']}])
@@ -51,7 +51,7 @@ async def test_manual_new_generation_supersedes_without_transfer(db_session, man
 async def test_open_partial_unique_and_terminal_release(db_session, managed):
     source, job = await claimed(db_session)
     aid, jid = source.id, job.id
-    gen = await g.admit_generation(db_session, jid)
+    gen = await admit_claimed(db_session, jid)
     gid = gen.id
     for status in ['building','prepared']:
         async with db_session.begin_nested():
@@ -76,7 +76,7 @@ async def test_open_partial_unique_and_terminal_release(db_session, managed):
 async def test_projection_uniqueness_and_archive_provenance(db_session, managed):
     source, job = await claimed(db_session)
     aid, jid, at = source.id, job.id, job.claimed_at
-    gen = await g.admit_generation(db_session, jid)
+    gen = await admit_claimed(db_session, jid)
     gid = gen.id
     claim = g.Claim(jid, aid, gid, 1, at)
     await g.raw_baseline(db_session, claim)
@@ -111,7 +111,7 @@ async def test_all_generation_erasure_and_permanent_retirement(db_session, manag
     await write_fts_entry(db_session, aid, 'alpha legacy')
     job=await db_session.get(Job,jid)
     attempt,at=job.attempts,job.claimed_at
-    gen=await g.admit_generation(db_session,jid)
+    gen=await admit_claimed(db_session,jid)
     await g.raw_baseline(db_session,g.Claim(jid,aid,gen.id,attempt,at))
     first, _ = await build(db_session, await db_session.get(Job,jid))
     job = await db_session.get(Job,jid)
@@ -152,7 +152,7 @@ async def test_all_generation_erasure_and_permanent_retirement(db_session, manag
 async def test_stale_claim_cannot_finish_or_persist(db_session, managed):
     source, job = await claimed(db_session)
     jid, aid, at = job.id, source.id, job.claimed_at
-    gen = await g.admit_generation(db_session,jid)
+    gen = await admit_claimed(db_session,jid)
     claim = g.Claim(jid,aid,gen.id,1,at)
     job = await db_session.get(Job,jid)
     job.attempts = 2
@@ -173,14 +173,14 @@ async def test_lock_order_and_cross_archive_tag_race(db_session, test_engine, ma
             locked.append(statement)
     event.listen(test_engine.sync_engine,'before_cursor_execute',capture)
     try:
-        gen1 = await g.admit_generation(db_session,jid1)
+        gen1 = await admit_claimed(db_session,jid1)
     finally:
         event.remove(test_engine.sync_engine,'before_cursor_execute',capture)
     assert len(locked) == 4
     assert all(f'FROM {name}' in query for name,query in zip(
         ['raw_archive','archive_derivation_heads','jobs','derivation_generations'],locked))
     gid1=gen1.id
-    gen2 = await g.admit_generation(db_session,jid2)
+    gen2 = await admit_claimed(db_session,jid2)
     c1,c2 = g.Claim(jid1,aid1,gid1,1,at1), g.Claim(jid2,aid2,gen2.id,1,at2)
     factory=async_sessionmaker(test_engine,expire_on_commit=False)
     async with factory() as left, factory() as right:
@@ -214,12 +214,22 @@ async def test_dirty_cached_job_cannot_override_locked_source_status(db_session,
     other,_=await claimed(db_session)
     other_aid=other.id
     job=await db_session.get(Job,jid)
+    # Capture valid dispatch ownership BEFORE dirtying the identity map. Do not
+    # use admit_claimed(): its populate_existing refresh would erase this proof.
+    token=g.Claim(jid,aid,job.generation_id,job.attempts,at)
+    source_hash=source.content_hash
     job.raw_archive_id=other_aid
     job.status='failed'
     job.attempts=99
-    gen=await g.admit_generation(db_session,jid)
+    source.deleted_at=datetime.now(timezone.utc)
+    source.content_hash='dirty-cache-only'
+    assert job in db_session.dirty and source in db_session.dirty
+    gen=await g.admit_generation(db_session,jid,expected_claim=token)
     assert gen.raw_archive_id==aid
+    assert gen.source_content_hash==source_hash
+    assert source.deleted_at is None and source.content_hash==source_hash
     current=await db_session.get(Job,jid,populate_existing=True)
+    assert current.raw_archive_id==aid and current.generation_id==gen.id
     assert current.status=='claimed' and current.attempts==1 and current.claimed_at==at
     assert await db_session.scalar(text('SELECT count(*) FROM archive_derivation_heads'))==1
     current.status='failed'  # Cached eligibility is not manual authorization.
@@ -266,7 +276,7 @@ async def test_terminal_owner_reconciled_before_replacement(db_session,managed):
     from app.domain.jobs.service import fail_job,reprocess_job
     _,job=await claimed(db_session)
     jid=job.id
-    gen=await g.admit_generation(db_session,jid)
+    gen=await admit_claimed(db_session,jid)
     oldgid=gen.id
     current=await db_session.get(Job,jid)
     # Simulate PR #14's job-only terminal commit and a crash before closure.

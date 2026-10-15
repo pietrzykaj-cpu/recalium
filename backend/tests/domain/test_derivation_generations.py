@@ -22,12 +22,20 @@ async def claimed(session):
     await session.commit()
     return source, job
 
+async def admit_claimed(session, job_id):
+    """Capture durable test ownership explicitly, as dispatch must do."""
+    from app.domain.derivations import service as g
+    job = await session.get(Job, job_id, populate_existing=True,
+                            execution_options={"autoflush": False})
+    token = g.Claim(job.id, job.raw_archive_id, job.generation_id, job.attempts, job.claimed_at)
+    return await g.admit_generation(session, job_id, expected_claim=token)
+
 @pytest.mark.asyncio
 async def test_dormant_admission(db_session):
     from app.domain.derivations.service import admit_generation, DerivationConflict
     _, job = await claimed(db_session)
     with pytest.raises(DerivationConflict):
-        await admit_generation(db_session, job.id)
+        await admit_claimed(db_session, job.id)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("batch", [[], [{"fact_text": "alpha assertion", "source_span": "alpha", "tags": ["one"], "entities": ["Anna"]}]])
@@ -36,7 +44,7 @@ async def test_replay_stable_ids_and_atomic_publication(db_session, managed, bat
     from app.domain.derivations.models import ArchiveDerivationHead, DerivationFtsProjection, DerivationStageCompletion
     source, job = await claimed(db_session)
     jid, aid, attempts, at = job.id, source.id, job.attempts, job.claimed_at
-    generation = await admit_generation(db_session, jid)
+    generation = await admit_claimed(db_session, jid)
     gid = generation.id
     claim = Claim(jid, aid, gid, attempts, at)
     await persist_summary(db_session, claim, None, outcome="empty")
@@ -61,7 +69,7 @@ async def test_two_session_extraction_completion(db_session, test_engine, manage
     from app.domain.derivations.service import admit_generation, Claim, persist_extraction
     source, job = await claimed(db_session)
     jid, aid, attempt, at = job.id, source.id, job.attempts, job.claimed_at
-    generation = await admit_generation(db_session, jid)
+    generation = await admit_claimed(db_session, jid)
     claim = Claim(jid, aid, generation.id, attempt, at)
     factory = async_sessionmaker(test_engine, expire_on_commit=False)
     async with factory() as left, factory() as right:
@@ -86,7 +94,7 @@ async def test_candidates_history_and_retired_headless(db_session, managed):
     legacy_id = legacy[0].id
     await write_fts_entry(db_session, aid, 'alpha legacy')
     assert [f.id for f in (await db_session.scalars(select(Fact))).all()] == [legacy_id]
-    gen = await admit_generation(db_session, jid)
+    gen = await admit_claimed(db_session, jid)
     claim = Claim(jid, aid, gen.id, attempt, at)
     await persist_summary(db_session, claim, None, outcome='empty')
     new = await persist_extraction(db_session, claim, [{'fact_text':'alpha managed'}])
@@ -114,9 +122,10 @@ async def test_two_jobs_cannot_admit_two_candidates(db_session, test_engine, man
     second_id = second.id
     factory = async_sessionmaker(test_engine, expire_on_commit=False)
     async with factory() as left, factory() as right:
-        results = await asyncio.gather(admit_generation(left, first_id), admit_generation(right, second_id), return_exceptions=True)
-    assert sum(isinstance(r, DerivationConflict) for r in results) == 1
-    assert (await db_session.execute(text('SELECT count(*) FROM derivation_generations'))).scalar_one() == 1
+        results = await asyncio.gather(admit_claimed(left, first_id), admit_claimed(right, second_id), return_exceptions=True)
+    assert all(isinstance(r, DerivationConflict) for r in results)
+    assert all(r.reason.value == 'state_inconsistent' for r in results)
+    assert (await db_session.execute(text('SELECT count(*) FROM derivation_generations'))).scalar_one() == 0
 
 @pytest.mark.asyncio
 async def test_extraction_rollback_has_no_partial_batch(db_session, managed, monkeypatch):
@@ -124,7 +133,7 @@ async def test_extraction_rollback_has_no_partial_batch(db_session, managed, mon
     import app.domain.derived_memory.service as writers
     source, job = await claimed(db_session)
     aid, jid, attempt, at = source.id, job.id, job.attempts, job.claimed_at
-    gen = await admit_generation(db_session, jid)
+    gen = await admit_claimed(db_session, jid)
     claim = Claim(jid, aid, gen.id, attempt, at)
     async def fail_tags(*args, **kwargs):
         raise RuntimeError('synthetic tag persistence failure')
@@ -151,7 +160,7 @@ async def test_lost_publication_ack_is_idempotent(db_session, managed, monkeypat
     from app.domain.derivations.models import ArchiveDerivationHead
     source, job = await claimed(db_session)
     aid, jid, attempt, at = source.id, job.id, job.attempts, job.claimed_at
-    gen = await admit_generation(db_session, jid)
+    gen = await admit_claimed(db_session, jid)
     gid = gen.id
     claim = Claim(jid, aid, gid, attempt, at)
     await persist_summary(db_session, claim, None, outcome='empty')
@@ -177,7 +186,7 @@ async def test_extraction_commit_ack_loss_fresh_session_reuses_exact_ids(db_sess
     from sqlalchemy import select
     source,job=await claimed(db_session)
     aid,jid,attempt,at=source.id,job.id,job.attempts,job.claimed_at
-    gen=await g.admit_generation(db_session,jid)
+    gen=await admit_claimed(db_session,jid)
     claim=g.Claim(jid,aid,gen.id,attempt,at)
     real_commit=db_session.commit
     async def uncertain_commit():

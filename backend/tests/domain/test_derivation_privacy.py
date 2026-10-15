@@ -16,7 +16,7 @@ from app.domain.derivations.models import (
 from app.domain.derived_memory.models import Fact
 from app.domain.derivations.visibility import HISTORY
 from app.infrastructure.settings import get_settings
-from tests.domain.test_derivation_generations import claimed, managed
+from tests.domain.test_derivation_generations import admit_claimed, claimed, managed
 from tests.domain.test_derivation_boundaries import build
 
 pytestmark = pytest.mark.asyncio
@@ -42,7 +42,7 @@ async def seed_history(session, candidate_status):
     aid, jid, content_hash = source.id, job.id, source.content_hash
     await write_facts(session, aid, [{"fact_text": "legacy private evidence"}])
     await write_fts_entry(session, aid, "legacy private evidence")
-    first = await g.admit_generation(session, jid)
+    first = await admit_claimed(session, jid)
     job = await session.get(type(job), jid)
     await g.raw_baseline(session, g.Claim(jid, aid, first.id, job.attempts, job.claimed_at))
     published = []
@@ -56,7 +56,7 @@ async def seed_history(session, candidate_status):
         await reprocess_job(session, jid)
         job = await claim_next_job(session)
         assert job.id == jid
-    gen = await g.admit_generation(session, jid)
+    gen = await admit_claimed(session, jid)
     job = await session.get(type(job), jid)
     candidate = g.Claim(jid, aid, gen.id, job.attempts, job.claimed_at)
     await g.persist_summary(session, candidate, "candidate private evidence")
@@ -237,8 +237,14 @@ async def test_publication_and_deletion_serialize_both_orders(
             release.set()
             await asyncio.wait_for(leading, 10)
             if first == "delete":
-                with pytest.raises(g.DerivationConflict):
+                with pytest.raises(g.DerivationConflict) as removed:
                     await asyncio.wait_for(trailing, 10)
+                assert removed.value.reason == g.ConflictReason.SOURCE_REMOVED
+                assert await g.resolve_conflict(publisher, claim, removed.value) == g.ConflictDisposition.CANCELLED
+                current = await publisher.get(type(job), claim.job_id, populate_existing=True)
+                assert current.status == "failed"
+                assert current.error_message == "derivation_cancelled:source_removed"
+                assert current.attempts == claim.attempts and current.claimed_at == claim.claimed_at
             else:
                 await asyncio.wait_for(trailing, 10)
         finally:

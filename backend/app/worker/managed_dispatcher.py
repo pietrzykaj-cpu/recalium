@@ -7,17 +7,46 @@ from app.infrastructure.settings import get_settings
 logger = logging.getLogger(__name__)
 
 async def dispatch_managed_job(session, job):
+    # Capture before any rollback/refresh; admission must fence this dispatch,
+    # not an identity-map row refreshed to a newer claim.
+    claim = g.Claim(job.id, job.raw_archive_id, job.generation_id, job.attempts, job.claimed_at)
+    replay = False
+    while True:
+        try:
+            if replay:
+                await dispatch_claim(session, claim, await g.snapshot(session, claim))
+            else:
+                generation = await g.admit_generation(session, claim.job_id, expected_claim=claim)
+                if generation is None:
+                    raise g.DerivationConflict(g.ConflictReason.JOB_GONE)
+                claim = replace(claim, generation_id=generation.id)
+                inputs = await g.snapshot(session, claim)
+                claim = replace(claim, policy_intent=(
+                    inputs["metadata"].get("processing_mode"), inputs["metadata"].get("sensitivity_hint")))
+                if inputs["status"] == "active":
+                    raise g.DerivationConflict(g.ConflictReason.ALREADY_PUBLISHED)
+                await dispatch_claim(session, claim, inputs)
+            return
+        except g.DerivationConflict as conflict:
+            outcome = await g.resolve_conflict(session, claim, conflict)
+            if outcome != g.ConflictDisposition.REPLAY:
+                return
+            if replay:
+                raise RuntimeError("Repeated published replay outcome") from conflict
+            # Not a job retry: only finish optional enrichment after the shared
+            # durable publication check. Missing embedding remains fillable.
+            replay = True
+
+
+async def dispatch_claim(session, claim, inputs):
     from app.worker import dispatcher as legacy
     from app.domain.policy.resolver import resolve_effective_policy
-    jid, aid, attempt, at = job.id, job.raw_archive_id, job.attempts, job.claimed_at
-    generation = await g.admit_generation(session, jid)
-    claim = g.Claim(jid, aid, generation.id, attempt, at)
-    inputs = await g.snapshot(session, claim)
-    claim = replace(claim, policy_intent=(
-        inputs["metadata"].get("processing_mode"), inputs["metadata"].get("sensitivity_hint")))
+    jid, attempt, at = claim.job_id, claim.attempts, claim.claimed_at
     # Includes the local gate model: no session transaction or lock may span it.
     try:
         decision = await legacy._gate.classify_async(inputs["raw"])
+    except g.DerivationConflict:
+        raise
     except Exception as exc:
         await g.fail_current_claim(session, jid, attempt, at,
             generation_id=claim.generation_id, error=legacy._stage_failure("gate","failure",exc))
@@ -43,6 +72,8 @@ async def dispatch_managed_job(session, job):
         if permissions["summarize"]["allowed"]:
             try:
                 text = await legacy._run_summarize_job(inputs["raw"], allow_external=policy.allow_external)
+            except g.DerivationConflict:
+                raise
             except Exception as exc:
                 category = legacy._summary_failure_category(exc)
                 failure = legacy._stage_failure("summary",category or "unclassified",exc)
@@ -72,6 +103,8 @@ async def dispatch_managed_job(session, job):
             batch = [{**f,"derivation_method":"llm_extraction","derivation_model":legacy._provider_name()} for f in batch]
             await g.persist_extraction(session, claim, batch,
                 outcome="succeeded" if permissions["extract"]["allowed"] else "policy_skipped")
+        except g.DerivationConflict:
+            raise
         except Exception as exc:
             error = legacy._stage_failure("extraction","failure",exc)
             await g.fail_current_claim(session, jid, attempt, at, generation_id=claim.generation_id,
@@ -83,6 +116,14 @@ async def dispatch_managed_job(session, job):
                             "summary" if inputs["summary"] is not None else "raw_fallback")
         await g.publish_generation(session, claim)
 
+    await enrich_and_finish(session, claim, allow_external=policy.allow_external)
+
+
+async def enrich_and_finish(session, claim, *, allow_external):
+    inputs = await g.snapshot(session, claim)
+    partial = inputs["summary_stage"]
+    marker = (f"summary_failed(category={partial[1]}, exception_class={partial[2]})"
+              if partial and partial[0] == "partial_failure" else None)
     # Enrichment is independent and non-fatal. Each model call follows an ended
     # prepare transaction; each write revalidates its current generation.
     try:
@@ -91,6 +132,8 @@ async def dispatch_managed_job(session, job):
             from app.domain.derived_memory.service import embed_text
             vector = await embed_text(inputs["summary"] if inputs["summary"] is not None else inputs["raw"][:10000])
             await g.persist_embedding(session, claim, vector)
+    except g.DerivationConflict:
+        raise
     except Exception as exc:
         await session.rollback()
         logger.warning("Managed embedding failed (non-fatal): %s", type(exc).__name__)
@@ -102,14 +145,18 @@ async def dispatch_managed_job(session, job):
             from sqlalchemy import select
             row = await session.scalar(select(Embedding).where(Embedding.generation_id == claim.generation_id))
             # No model call in duplicate detection. Fence all involved sources.
-            await detect_and_group_duplicates(session, raw_archive_id=aid,
+            await detect_and_group_duplicates(session, raw_archive_id=claim.archive_id,
                 embedding_id=row.id, embedding=inputs["embedding"])
+    except g.DerivationConflict:
+        raise
     except Exception as exc:
         await session.rollback()
         logger.warning("Managed conflict enrichment failed (non-fatal): %s",type(exc).__name__)
     try:
         from app.worker.managed_links import run_managed_links
-        await run_managed_links(session, claim, allow_external=policy.allow_external)
+        await run_managed_links(session, claim, allow_external=allow_external)
+    except g.DerivationConflict:
+        raise
     except Exception as exc:
         await session.rollback()
         logger.warning("Managed link enrichment failed (non-fatal): %s",type(exc).__name__)
