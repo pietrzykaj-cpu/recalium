@@ -397,8 +397,8 @@ async def test_bundle_tombstones_lock_all_archives_before_suppression(
     for aid, _, gid, stamp in sources:
         head = await db_session.get(Head, aid, populate_existing=True)
         assert head.active_generation_id is None and head.legacy_retired_at == stamp
-        # M3 is deliberately not fixed here; preserve the reviewed lifecycle.
-        assert (await db_session.get(Gen, gid, populate_existing=True)).status == 'active'
+        # M3: clearing the serving head also terminally withdraws its generation.
+        assert (await db_session.get(Gen, gid, populate_existing=True)).status == 'abandoned'
         source = await db_session.get(type(unrelated), aid, populate_existing=True)
         assert source.deleted_at is not None and source.raw_content == REDACTION_MARKER
         projection = (await db_session.execute(text('SELECT text_content,source_status,search_vector '

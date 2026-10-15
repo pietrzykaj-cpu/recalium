@@ -18,12 +18,20 @@ async def lock_existing_heads(session, archive_ids):
         .with_for_update().execution_options(populate_existing=True, autoflush=False))
 
 async def suppress_generations(session, archive_id):
+    """Terminal privacy withdrawal, including previously published generations.
+
+    building/prepared -> abandoned; active -> abandoned (privacy withdrawal only).
+    superseded/failed/abandoned remain unchanged. Publication and supersession
+    timestamps, provenance and monotonic legacy retirement are never rewritten.
+    The caller holds the archive/head/generation locks and commits suppression,
+    erasure and head clearing atomically; withdrawal does not authorize restore.
+    """
     if not await schema_present(session):
         return
     await session.execute(text("""UPDATE derivation_fts_projections SET source_status='source_removed'
         WHERE raw_archive_id=:aid"""), {"aid":archive_id})
     await session.execute(text("""UPDATE derivation_generations SET status='abandoned'
-        WHERE raw_archive_id=:aid AND status IN ('building','prepared')"""), {"aid":archive_id})
+        WHERE raw_archive_id=:aid AND status IN ('building','prepared','active')"""), {"aid":archive_id})
     # Omit retirement column: it survives deletion and the DB trigger forbids reset.
     await session.execute(text("""UPDATE archive_derivation_heads
         SET active_generation_id=NULL, candidate_generation_id=NULL WHERE raw_archive_id=:aid"""),
