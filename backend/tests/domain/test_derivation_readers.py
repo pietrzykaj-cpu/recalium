@@ -7,7 +7,7 @@ from app.infrastructure.settings import get_settings
 from app.domain.derivations import service as g
 from app.domain.derivations.models import ArchiveDerivationHead as Head
 from app.domain.derived_memory.models import Fact, Embedding, ConflictGroup
-from tests.domain.test_derivation_generations import claimed, managed
+from tests.domain.test_derivation_generations import admit_claimed, claimed, managed
 from tests.domain.test_derivation_boundaries import build
 
 async def versions(session):
@@ -129,7 +129,7 @@ async def test_off_old_fts_on_new_baseline_then_atomic_switch(db_session,managed
     source,job=await claimed(db_session)
     aid,jid,at = source.id,job.id,job.claimed_at
     await write_fts_entry(db_session,aid,'oldsourceword')
-    gen=await g.admit_generation(db_session,jid)
+    gen=await admit_claimed(db_session,jid)
     claim=g.Claim(jid,aid,gen.id,1,at)
     await g.raw_baseline(db_session,claim)
     assert not await _keyword_candidates(db_session,'oldsourceword')

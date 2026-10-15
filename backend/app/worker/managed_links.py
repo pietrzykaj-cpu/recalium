@@ -52,6 +52,8 @@ async def run_managed_links(session, claim, *, allow_external):
             for tid in target_ids[:5]:
                 try:
                     kind = await legacy._classify_link_pair(source_texts[sid],target_texts[tid])
+                except g.DerivationConflict:
+                    raise
                 except Exception as exc:
                     errors.append((sid, tid, legacy._bounded_exception_class(exc)))
                     continue
