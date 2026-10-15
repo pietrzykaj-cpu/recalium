@@ -24,6 +24,7 @@ from typing import Literal
 from cachetools import TTLCache
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.domain.derivations.visibility import enabled, current_sql
 
 from app.domain.audit.models import AuditEvent
 from app.domain.derived_memory.service import ACTIVE_EMBEDDING_MODEL
@@ -509,7 +510,7 @@ async def _keyword_candidates(
     if tags:
         normalised = [t.strip().lower() for t in tags if t.strip()]
         if normalised:
-            tag_filter_sql = """
+            tag_filter_sql = f"""
               AND fe.raw_archive_id IN (
                   SELECT f.raw_archive_id
                   FROM facts f
@@ -517,6 +518,7 @@ async def _keyword_candidates(
                   JOIN tags tg ON tg.id = ft.tag_id
                   WHERE f.source_status = 'active'
                                         AND f.review_status = 'active'
+                    {current_sql('f')}
                     AND tg.name = ANY(:tag_names)
                   GROUP BY f.raw_archive_id
                   HAVING COUNT(DISTINCT tg.name) >= :tag_count
@@ -540,9 +542,10 @@ async def _keyword_candidates(
                     ra.ingested_at::text AS captured_at,
                     NULL::text AS conflict_label,
                     fe.raw_archive_id::text AS archive_id
-                FROM fts_entries fe
+                FROM {'derivation_fts_projections' if enabled() else 'fts_entries'} fe
                 JOIN raw_archive ra ON ra.id = fe.raw_archive_id
                 WHERE fe.source_status = 'active'
+                  {current_sql('fe')}
                   AND ra.deleted_at IS NULL
                   AND fe.search_vector @@ websearch_to_tsquery('english', :q)
                   {tag_filter_sql}
@@ -600,6 +603,7 @@ async def _keyword_candidates(
                 JOIN raw_archive ra ON ra.id = f.raw_archive_id
                 WHERE f.source_status = 'active'
                   AND f.review_status = 'active'
+                  {current_sql('f')}
                   AND ra.deleted_at IS NULL
                   AND f.search_vector @@ websearch_to_tsquery('english', :q)
                   {archive_filter_sql}
@@ -668,9 +672,20 @@ async def _semantic_candidates(
     # therefore yields nothing from this mode.
     if f.canonical_only:
         return [], False
+    if enabled():
+        from app.domain.derivations.readers import prepared_query
+        prepared = prepared_query.get()
+        if prepared is None or prepared[0] != query:
+            raise RuntimeError('Managed query embedding must precede the reader transaction')
+        query_vector = prepared[1]
+        if query_vector is None:
+            return [], True
+    else:
+        query_vector = None
     try:
         from app.domain.derived_memory.service import embed_text
-        query_vector = await embed_text(query)
+        if not enabled():
+            query_vector = await embed_text(query)
     except RuntimeError:
         logger.info("Semantic search unavailable: sentence-transformers not installed (degraded mode)")
         return [], True
@@ -681,7 +696,7 @@ async def _semantic_candidates(
     if tags:
         normalised = [t.strip().lower() for t in tags if t.strip()]
         if normalised:
-            tag_filter_sql = """
+            tag_filter_sql = f"""
               AND e.raw_archive_id IN (
                   SELECT f.raw_archive_id
                   FROM facts f
@@ -689,6 +704,7 @@ async def _semantic_candidates(
                   JOIN tags tg ON tg.id = ft.tag_id
                   WHERE f.source_status = 'active'
                                         AND f.review_status = 'active'
+                    {current_sql('f')}
                     AND tg.name = ANY(:tag_names)
                   GROUP BY f.raw_archive_id
                   HAVING COUNT(DISTINCT tg.name) >= :tag_count
@@ -709,6 +725,7 @@ async def _semantic_candidates(
             FROM embeddings e
             JOIN raw_archive ra ON ra.id = e.raw_archive_id
             WHERE e.source_status = 'active'
+              {current_sql('e')}
               AND ra.deleted_at IS NULL
               AND e.embedding_model = :model
               {tag_filter_sql}
@@ -732,9 +749,10 @@ async def _semantic_candidates(
     candidates = []
     for row in rows:
         summary_result = await session.execute(
-            text("""
-                SELECT summary_text FROM summaries
+            text(f"""
+                SELECT summary_text FROM summaries s
                 WHERE raw_archive_id = :aid AND source_status = 'active'
+                {current_sql('s')}
                 ORDER BY created_at, id
                 LIMIT 1
             """),
@@ -824,6 +842,7 @@ async def _traverse_links(
               AND tf.source_status = 'active'
                             AND sf.review_status = 'active'
                             AND tf.review_status = 'active'
+              {current_sql('sf')} {current_sql('tf')}
               AND ra.deleted_at IS NULL
               AND ml.link_type != 'contradicts'
               {scope_sql}
@@ -915,6 +934,30 @@ async def retrieve(
     req: RetrievalRequest,
     diagnostics: RetrievalDiagnosticsCollector | None = None,
 ) -> RetrievalResponse:
+    if not enabled():
+        return await _retrieve_current(session, req, diagnostics)
+    from app.domain.derivations.readers import prepared_query, prepare_query, begin_reader_snapshot
+    prepared = prepared_query.get()
+    token = None
+    if prepared is None:
+        if session.new or session.dirty or session.deleted:
+            raise RuntimeError('Managed retrieval requires completed caller writes')
+        await session.rollback()
+        prepared = await prepare_query(req.query, req.mode, canonical_only=req.filters.canonical_only)
+        token = prepared_query.set(prepared)
+    try:
+        await begin_reader_snapshot(session)
+        return await _retrieve_current(session, req, diagnostics)
+    finally:
+        if token is not None:
+            prepared_query.reset(token)
+
+
+async def _retrieve_current(
+    session: AsyncSession,
+    req: RetrievalRequest,
+    diagnostics: RetrievalDiagnosticsCollector | None = None,
+) -> RetrievalResponse:
     """Execute retrieval and return a context-budgeted response.
 
     Modes: keyword, semantic, hybrid.
@@ -932,7 +975,7 @@ async def retrieve(
             f"Invalid retrieval mode {req.mode!r}: must be 'keyword', 'semantic', or 'hybrid'"
         )
     cache_key = _cache_key(req)
-    cache_allowed = diagnostics is None
+    cache_allowed = diagnostics is None and not enabled()
     scoped = _bridge_spaces(req.filters) is not None
     if diagnostics is not None and scoped:
         diagnostics.filters.pop("bridge_project_id", None)

@@ -11,6 +11,8 @@ MCP-03: access event audit (event_type='mcp_retrieve')
 MCP-04: client identity recorded in actor field
 """
 from __future__ import annotations
+from app.domain.derivations.visibility import current_sql, enabled
+from app.domain.derivations.readers import begin_reader_snapshot
 
 import logging
 from typing import Any
@@ -175,8 +177,9 @@ async def get_fact_links(
     factory = get_session_factory()
     async with factory() as session:
         try:
+            await begin_reader_snapshot(session)
             fact_check = (await session.execute(
-                text("SELECT id FROM facts WHERE id = :fid AND source_status = 'active' AND review_status = 'active' LIMIT 1"),
+                text("SELECT id FROM facts f WHERE id = :fid AND source_status = 'active' AND review_status = 'active' " + current_sql('f') + " LIMIT 1"),
                 {"fid": str(fid)},
             )).fetchone()
             if fact_check is None:
@@ -187,22 +190,22 @@ async def get_fact_links(
                 other_id_col = "ml.target_fact_id::text AS other_fact_id"
                 join_clause = "JOIN facts tf ON tf.id = ml.target_fact_id"
                 text_col = "tf.fact_text AS other_fact_text"
-                status_filter = "AND tf.source_status = 'active' AND tf.review_status = 'active'"
+                status_filter = "AND tf.source_status = 'active' AND tf.review_status = 'active'" + current_sql('tf')
             elif direction == "incoming":
                 where = "ml.target_fact_id = :fid"
                 other_id_col = "ml.source_fact_id::text AS other_fact_id"
                 join_clause = "JOIN facts sf ON sf.id = ml.source_fact_id"
                 text_col = "sf.fact_text AS other_fact_text"
-                status_filter = "AND sf.source_status = 'active' AND sf.review_status = 'active'"
+                status_filter = "AND sf.source_status = 'active' AND sf.review_status = 'active'" + current_sql('sf')
             else:
                 where = "(ml.source_fact_id = :fid OR ml.target_fact_id = :fid)"
                 other_id_col = """CASE WHEN ml.source_fact_id = :fid THEN ml.target_fact_id::text ELSE ml.source_fact_id::text END AS other_fact_id"""
                 join_clause = "LEFT JOIN facts tf ON tf.id = ml.target_fact_id LEFT JOIN facts sf ON sf.id = ml.source_fact_id"
                 text_col = """CASE WHEN ml.source_fact_id = :fid THEN tf.fact_text ELSE sf.fact_text END AS other_fact_text"""
-                status_filter = """
+                status_filter = f"""
                                         AND (
-                                            (ml.source_fact_id = :fid AND tf.source_status = 'active' AND tf.review_status = 'active')
-                                            OR (ml.target_fact_id = :fid AND sf.source_status = 'active' AND sf.review_status = 'active')
+                                            (ml.source_fact_id = :fid AND tf.source_status = 'active' AND tf.review_status = 'active' {current_sql('tf')})
+                                            OR (ml.target_fact_id = :fid AND sf.source_status = 'active' AND sf.review_status = 'active' {current_sql('sf')})
                                         )"""
 
             rows = (await session.execute(
@@ -261,8 +264,9 @@ async def list_tags(
     factory = get_session_factory()
     async with factory() as session:
         try:
+            await begin_reader_snapshot(session)
             rows = (await session.execute(
-                text("""
+                text(f"""
                     SELECT
                         t.id::text AS id,
                         t.name,
@@ -271,7 +275,9 @@ async def list_tags(
                     FROM tags t
                     LEFT JOIN fact_tags ft ON ft.tag_id = t.id
                     LEFT JOIN facts f ON f.id = ft.fact_id AND f.source_status = 'active' AND f.review_status = 'active'
+                    {current_sql('f')}
                     GROUP BY t.id, t.name, t.created_at
+                    {'HAVING COUNT(f.id) > 0' if enabled() else ''}
                     ORDER BY fact_count DESC, t.name ASC
                 """),
             )).mappings().all()

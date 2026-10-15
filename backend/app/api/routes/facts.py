@@ -103,6 +103,8 @@ async def _list_facts_response(
     review_status: str | None,
     confidence_tier: str | None,
 ) -> dict[str, Any]:
+    from app.domain.derivations.readers import begin_reader_snapshot
+    await begin_reader_snapshot(session)
     query = select(Fact).where(Fact.source_status == source_status)
     if review_status is None:
         query = query.where(Fact.review_status.in_(VISIBLE_REVIEW_STATUSES))
@@ -182,10 +184,26 @@ async def get_fact(
     Powers the memory detail view. Returns the fact regardless of review
     status so a linked/promoted fact still resolves; 404 if it does not exist.
     """
-    fact = await session.scalar(select(Fact).where(Fact.id == fact_id))
+    from app.domain.derivations.visibility import enabled, HISTORY
+    from app.domain.derivations.readers import begin_reader_snapshot
+    await begin_reader_snapshot(session)
+    fact = await session.scalar(select(Fact).where(Fact.id == fact_id).execution_options(
+        **HISTORY, populate_existing=enabled()))
     if fact is None:
         raise HTTPException(status_code=404, detail=f"Fact {fact_id} not found")
-    return _fact_to_dict(fact)
+    result = _fact_to_dict(fact)
+    if enabled():
+        from app.domain.derivations.models import DerivationGeneration, ArchiveDerivationHead
+        if fact.generation_id is not None:
+            generation = await session.get(DerivationGeneration, fact.generation_id)
+            if generation is None or generation.published_at is None:
+                raise HTTPException(status_code=404, detail='Fact not found')
+        head = await session.get(ArchiveDerivationHead, fact.raw_archive_id)
+        is_current = (head.active_generation_id == fact.generation_id if head and head.active_generation_id
+                      else fact.generation_id is None and (head is None or head.legacy_retired_at is None))
+        result.update(generation_id=str(fact.generation_id) if fact.generation_id else None,
+                      generation_visibility='current' if is_current else 'history')
+    return result
 
 
 @router.patch("/{fact_id}")

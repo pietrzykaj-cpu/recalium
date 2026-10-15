@@ -34,6 +34,9 @@ class ArchiveItemNotFoundError(Exception):
 
 async def _suppress_derived(session: AsyncSession, archive_id_str: str) -> None:
     """Mark all derived rows for a source as source_removed (PRIV-01/PRIV-02)."""
+    from app.domain.derivations.privacy import lock_existing_heads, suppress_generations
+    await lock_existing_heads(session, [uuid.UUID(archive_id_str)])
+    await suppress_generations(session, archive_id_str)
     for table in ("summaries", "facts", "embeddings", "fts_entries"):
         await session.execute(
             text(
@@ -84,6 +87,8 @@ async def _erase_plaintext(session: AsyncSession, archive_id_str: str) -> None:
     memory text is intentionally NOT erased (PRIV-02 keeps it for review), but it
     is suppressed and excluded from retrieval.
     """
+    from app.domain.derivations.privacy import erase_projections
+    await erase_projections(session, archive_id_str, REDACTION_MARKER)
     await session.execute(
         text("UPDATE raw_archive SET raw_content = :m WHERE id = :id"),
         {"m": REDACTION_MARKER, "id": archive_id_str},
@@ -270,6 +275,13 @@ async def reapply_tombstones(
     Returns a summary dict: {tombstones, reapplied}.
     """
     ledger = read_tombstone_ledger(backup_dir)
+    # Acquire ALL source rows before any head/generation for a multi-source restore.
+    hashes = [r.get('content_hash') for r in ledger if r.get('content_hash')]
+    locked = (await session.scalars(select(RawArchiveItem).where(
+        RawArchiveItem.content_hash.in_(hashes), RawArchiveItem.deleted_at.is_(None))
+        .order_by(RawArchiveItem.id).with_for_update())).all()
+    from app.domain.derivations.privacy import lock_existing_heads
+    await lock_existing_heads(session, [r.id for r in locked])
     reapplied = 0
 
     for record in ledger:

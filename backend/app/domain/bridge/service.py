@@ -147,10 +147,30 @@ async def _destination(session, actor, req):
 
 
 async def execute(session, authorization, operation, request):
+    from app.domain.derivations.visibility import enabled
+    if not enabled() or operation not in ('retrieve_memory','build_context_packet','build_continuity_handoff'):
+        return await _execute_locked(session, authorization, operation, request)
+    # First authenticate/authorize without producing output; release those locks
+    # before local query-model work. Final phase freshly reacquires all E1 locks.
+    from app.domain.derivations.readers import prepared_query, prepare_query
+    await _execute_locked(session, authorization, operation, request, _preflight=True)
+    vector = await prepare_query(request.query, request.mode)
+    token = prepared_query.set(vector)
+    try:
+        return await _execute_locked(session, authorization, operation, request)
+    finally:
+        prepared_query.reset(token)
+
+
+async def _execute_locked(session, authorization, operation, request, *, _preflight=False):
     actor = "unauthenticated"
     resolved = []
     destination = None
     try:
+        from app.domain.derivations.visibility import enabled
+        if enabled() and operation in ('retrieve_memory','build_context_packet','build_continuity_handoff'):
+            from app.domain.derivations.readers import begin_reader_snapshot
+            await begin_reader_snapshot(session)
         scheme, _, credential = (authorization or "").partition(" ")
         if scheme.lower() != "bearer" or not 32 <= len(credential) <= 256:
             raise BridgeError(401, "authentication_required")
@@ -162,6 +182,7 @@ async def execute(session, authorization, operation, request):
                     BridgeClient.active.is_(True),
                 )
                 .with_for_update(read=True)
+                .execution_options(populate_existing=enabled())
             )
         ).scalar_one_or_none()
         if principal is None:
@@ -217,6 +238,9 @@ async def execute(session, authorization, operation, request):
             if requested is not None and not set(requested).issubset(spaces):
                 raise BridgeError(403, "permission_denied")
             resolved = sorted(spaces)
+            if _preflight:
+                await session.commit()
+                return
             if operation == "retrieve_memory":
                 response = await _retrieve(session, actor, request, spaces)
             elif operation == "build_context_packet":
@@ -375,6 +399,7 @@ async def _processing(session, item):
                     Fact.source_status == "active",
                     Fact.review_status == "active",
                 )
+                .execution_options(derivation_history=item['type'] == 'canonical')
             )
         ).scalar_one_or_none()
         if fact is None:

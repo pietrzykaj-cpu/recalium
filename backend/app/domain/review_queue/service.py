@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import select
+from app.domain.derivations.visibility import enabled, current, HISTORY
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.derived_memory.models import ConflictGroup, Fact
@@ -35,6 +36,24 @@ class ReviewItemNotFoundError(Exception):
 
 class InvalidResolutionActionError(Exception):
     """Raised when an unknown resolution action is requested (GPT5.6 #10)."""
+
+class ReviewItemStaleError(Exception):
+    """Historical/mixed-generation groups cannot be partially resolved as current."""
+
+async def _current_group(session, group_id, *, lock=False):
+    if not enabled():
+        return True
+    all_facts = (await session.scalars(select(Fact).where(Fact.conflict_group_id == group_id,
+        Fact.source_status == 'active').execution_options(**HISTORY))).all()
+    if lock:
+        from app.domain.derivations.service import lock_archives_and_heads
+        await lock_archives_and_heads(session, [f.raw_archive_id for f in all_facts])
+        all_facts = (await session.scalars(select(Fact).where(Fact.conflict_group_id == group_id,
+            Fact.source_status == 'active').execution_options(**HISTORY, populate_existing=True))).all()
+    ids = {f.id for f in all_facts}
+    visible = set((await session.scalars(select(Fact.id).where(Fact.id.in_(ids),
+        Fact.source_status=='active'))).all())
+    return bool(ids) and ids == visible
 
 
 def _reindex_after_curation() -> None:
@@ -61,6 +80,8 @@ async def _apply_resolution(
 
     Marks the ConflictGroup resolved. Returns a summary dict.
     """
+    if enabled() and not await _current_group(session, conflict_group_id, lock=True):
+        raise ReviewItemStaleError('Review group is no longer current')
     facts = (
         await session.execute(
             select(Fact).where(
@@ -125,13 +146,18 @@ async def list_pending_review_items(
     session: AsyncSession,
 ) -> list[ReviewQueueItem]:
     """Return all pending, active review queue items (CANM-05)."""
+    from app.domain.derivations.readers import begin_reader_snapshot
+    await begin_reader_snapshot(session)
     result = await session.execute(
         select(ReviewQueueItem).where(
             ReviewQueueItem.status == "pending",
             ReviewQueueItem.source_status == "active",
         )
     )
-    return list(result.scalars().all())
+    items = list(result.scalars().all())
+    if enabled():
+        items = [item for item in items if await _current_group(session, item.conflict_group_id)]
+    return items
 
 
 async def resolve_review_item(
@@ -159,6 +185,8 @@ async def resolve_review_item(
     item = result.scalar_one_or_none()
     if item is None:
         raise ReviewItemNotFoundError(f"ReviewQueueItem {item_id} not found.")
+    if enabled() and (item.source_status != 'active' or item.status != 'pending'):
+        raise ReviewItemStaleError('Review item is no longer actionable')
 
     summary = await _apply_resolution(session, item.conflict_group_id, action)
 
@@ -192,6 +220,8 @@ async def dismiss_review_item(
     item = result.scalar_one_or_none()
     if item is None:
         raise ReviewItemNotFoundError(f"ReviewQueueItem {item_id} not found.")
+    if enabled() and (item.source_status != 'active' or item.status != 'pending'):
+        raise ReviewItemStaleError('Review item is no longer actionable')
 
     await _apply_resolution(session, item.conflict_group_id, "keep")
 

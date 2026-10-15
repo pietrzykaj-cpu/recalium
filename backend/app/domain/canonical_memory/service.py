@@ -71,14 +71,31 @@ async def promote_fact_to_canonical(
     """
     from app.domain.archive.models import RawArchiveItem  # noqa: PLC0415
     from app.domain.derived_memory.models import Fact  # noqa: PLC0415
+    from app.domain.derivations.visibility import enabled, HISTORY
+
+    if enabled():
+        # Keep the managed archive/head order even for explicit historical curation.
+        # Never take a fact lock before the source lock used by deletion/publication.
+        source_id = await session.scalar(select(Fact.raw_archive_id).where(
+            Fact.id == fact_id).execution_options(**HISTORY))
+        if source_id is None:
+            raise FactNotFoundError(f"Fact {fact_id} not found.")
+        from app.domain.derivations.service import lock_archives_and_heads
+        await lock_archives_and_heads(session, [source_id])
 
     fact = (
         await session.execute(
-            select(Fact).where(Fact.id == fact_id).with_for_update()
+            select(Fact).where(Fact.id == fact_id).with_for_update().execution_options(
+                **HISTORY, populate_existing=enabled())
         )
     ).scalar_one_or_none()
     if fact is None:
         raise FactNotFoundError(f"Fact {fact_id} not found.")
+    if enabled() and fact.generation_id is not None:
+        from app.domain.derivations.models import DerivationGeneration
+        generation = await session.get(DerivationGeneration, fact.generation_id)
+        if generation is None or generation.published_at is None:
+            raise FactNotFoundError('Unpublished candidate cannot be promoted')
 
     # A removed fact must not be promotable — that would resurrect deleted content.
     if fact.source_status != "active":

@@ -16,6 +16,7 @@ from app.domain.derived_memory.models import ConflictGroup, Fact
 from app.domain.review_queue.service import (
     InvalidResolutionActionError,
     ReviewItemNotFoundError,
+    ReviewItemStaleError,
     dismiss_review_item,
     list_pending_review_items,
     resolve_review_item,
@@ -115,6 +116,8 @@ async def resolve(
         )
     except ReviewItemNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except ReviewItemStaleError:
+        raise HTTPException(status_code=409, detail='Review group is no longer current')
     except InvalidResolutionActionError as e:
         raise HTTPException(status_code=422, detail=str(e))
     return await _item_to_dict(item, session)
@@ -129,4 +132,6 @@ async def dismiss(
         item = await dismiss_review_item(session, item_id)
     except ReviewItemNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except ReviewItemStaleError:
+        raise HTTPException(status_code=409, detail='Review group is no longer current')
     return await _item_to_dict(item, session)
