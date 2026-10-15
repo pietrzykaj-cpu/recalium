@@ -4,7 +4,8 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import String, Text, Integer, TIMESTAMP, ForeignKey
+from sqlalchemy import String, Text, Integer, TIMESTAMP, ForeignKey, UniqueConstraint
+from app.domain.derivations.models import generation_fk
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -19,6 +20,7 @@ class Job(Base):
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
     job_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    generation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
     raw_archive_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("raw_archive.id", ondelete="CASCADE"),
@@ -36,3 +38,4 @@ class Job(Base):
     )
     claimed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint('id', 'raw_archive_id', name='uq_job_archive'), generation_fk('jobs'))

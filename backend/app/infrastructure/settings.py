@@ -34,6 +34,8 @@ class Settings(BaseSettings):
     app_env: str = "production"
     log_level: str = "info"
     app_port: int = 8000
+    # R2: one dormant writer/reader cutover; production flip requires its own gate.
+    generation_idempotency_enabled: bool = False
 
     # Network exposure settings
     app_bind_host: str = "127.0.0.1"

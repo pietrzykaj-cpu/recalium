@@ -17,6 +17,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.derived_memory.models import Summary, Fact, FtsEntry, Embedding, Tag, FactTag, MemoryLink
+from app.domain.derivations.visibility import current_sql
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +115,7 @@ async def write_facts(
     session: AsyncSession,
     raw_archive_id: uuid.UUID,
     facts_data: list[dict],
+    *, commit: bool = True, generation_id: uuid.UUID | None = None,
 ) -> list[Fact]:
     """Write extracted facts for a raw archive item.
 
@@ -142,6 +144,7 @@ async def write_facts(
 
         fact = Fact(
             raw_archive_id=raw_archive_id,
+            generation_id=generation_id,
             fact_text=item["fact_text"],
             source_span=item.get("source_span", ""),
             confidence_tier=confidence_tier,
@@ -153,9 +156,12 @@ async def write_facts(
         created.append(fact)
 
     if created:
-        await session.commit()
-        for fact in created:
-            await session.refresh(fact)
+        if commit:
+            await session.commit()
+            for fact in created:
+                await session.refresh(fact)
+        else:
+            await session.flush()
         logger.debug("Wrote %d facts for archive_id=%s", len(created), raw_archive_id)
 
     return created
@@ -242,8 +248,8 @@ async def embedding_model_health(session: AsyncSession) -> dict:
     """
     result = await session.execute(
         text(
-            "SELECT embedding_model, count(*) AS n FROM embeddings "
-            "WHERE source_status = 'active' GROUP BY embedding_model"
+            "SELECT embedding_model, count(*) AS n FROM embeddings e "
+            "WHERE source_status = 'active' " + current_sql('e') + " GROUP BY embedding_model"
         )
     )
     by_model = {row.embedding_model: int(row.n) for row in result}
@@ -260,11 +266,23 @@ async def embedding_model_health(session: AsyncSession) -> dict:
 
 # ── Linkage & tagging writers ─────────────────────────────────────────────────
 
+async def upsert_tag_names(session: AsyncSession, names: list[str]) -> dict[str, uuid.UUID]:
+    """Lock all names in batch order, not a different order per fact."""
+    from sqlalchemy.dialects.postgresql import insert
+    result = {}
+    for name in sorted({n.strip().lower() for n in names if n.strip()}):
+        await session.execute(insert(Tag).values(id=uuid.uuid4(), name=name)
+            .on_conflict_do_nothing(index_elements=[Tag.name]))
+        result[name] = await session.scalar(select(Tag.id).where(Tag.name == name))
+    return result
+
+
 async def write_tags(
     session: AsyncSession,
     fact_id: uuid.UUID,
     tags: list[str],
     assigned_by: str = "pipeline",
+    *, commit: bool = True, prepared_tag_ids: dict | None = None,
 ) -> list[FactTag]:
     """Upsert tags and create FactTag associations for a fact.
 
@@ -274,6 +292,19 @@ async def write_tags(
     """
     if not tags:
         return []
+
+    if not commit:
+        # Managed extraction owns the commit. Sorted, database-enforced upserts
+        # handle tag-name races between different archives without partial batches.
+        from sqlalchemy.dialects.postgresql import insert
+        tag_ids = prepared_tag_ids if prepared_tag_ids is not None else await upsert_tag_names(session, tags)
+        created = []
+        for name in sorted({t.strip().lower() for t in tags if t.strip()}):
+            tag_id = tag_ids[name]
+            await session.execute(insert(FactTag).values(fact_id=fact_id, tag_id=tag_id,
+                assigned_by=assigned_by).on_conflict_do_nothing())
+        await session.flush()
+        return created
 
     created: list[FactTag] = []
     for raw_name in tags:
@@ -313,6 +344,7 @@ async def write_tags(
 async def write_links(
     session: AsyncSession,
     links_data: list[dict],
+    *, commit: bool = True,
 ) -> list[MemoryLink]:
     """Write memory links between facts.
 
@@ -363,9 +395,12 @@ async def write_links(
         created.append(link)
 
     if created:
-        await session.commit()
-        for link in created:
-            await session.refresh(link)
+        if commit:
+            await session.commit()
+            for link in created:
+                await session.refresh(link)
+        else:
+            await session.flush()
         logger.debug("Wrote %d memory links", len(created))
 
     return created

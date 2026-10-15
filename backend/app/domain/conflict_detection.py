@@ -16,6 +16,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.derived_memory.models import ConflictGroup, Embedding, Fact
+from app.domain.derivations.visibility import enabled, current_sql
 
 logger = logging.getLogger(__name__)
 
@@ -42,11 +43,12 @@ async def find_duplicate_candidates(
         List of embedding UUIDs within DUPLICATE_DISTANCE_THRESHOLD.
     """
     result = await session.execute(
-        text("""
+        text(f"""
             SELECT id
-            FROM embeddings
+            FROM embeddings e
             WHERE id != :exclude_id
               AND source_status = 'active'
+              {current_sql('e')}
               AND embedding <=> :vec < :threshold
             ORDER BY embedding <=> :vec
             LIMIT :max_candidates
@@ -157,6 +159,8 @@ async def detect_and_group_duplicates(
     Returns a ``DuplicateDetection`` (group + involved items + linked fact count)
     or ``None`` when no other item is a near-duplicate.
     """
+    if enabled():
+        return await _detect_current_generations(session, raw_archive_id, embedding_id, embedding)
     candidates = await find_duplicate_candidates(
         session, embedding=embedding, exclude_id=embedding_id
     )
@@ -185,3 +189,38 @@ async def detect_and_group_duplicates(
         duplicate_archive_ids=dup_archive_ids,
         linked_fact_count=linked,
     )
+
+async def _detect_current_generations(session, archive_id, embedding_id, vector):
+    """Visibility/fencing only; intentionally NOT conflict/review replay identity."""
+    from app.domain.derivations import service as g
+    from app.domain.review_queue.service import materialize_review_item
+    async with g.transaction(session):
+        candidates = await find_duplicate_candidates(session, vector, embedding_id)
+        other_ids = await _resolve_embedding_archive_ids(session, candidates)
+        sources,_ = await g.lock_archives_and_heads(session, [archive_id, *other_ids])
+        if not all([await g.source_live(session,s) for s in sources.values()]):
+            return None
+        own = await session.scalar(select(Embedding).where(Embedding.id == embedding_id,
+            Embedding.raw_archive_id == archive_id, Embedding.source_status == "active"))
+        if own is None:
+            return None
+        fresh = (await session.scalars(select(Embedding).where(
+            Embedding.id.in_(candidates), Embedding.source_status == "active"))).all()
+        other_ids = sorted({e.raw_archive_id for e in fresh if e.raw_archive_id != archive_id}, key=str)
+        if not other_ids:
+            return None
+        group = ConflictGroup(group_type="duplicate")
+        session.add(group)
+        await session.flush()
+        result = await session.execute(update(Fact).where(
+            Fact.raw_archive_id.in_([archive_id,*other_ids]), Fact.source_status=="active",
+            Fact.review_status=="active", Fact.conflict_group_id.is_(None))
+            .values(conflict_group_id=group.id))
+        await materialize_review_item(session, group.id, "duplicate")
+        from app.domain.audit.models import AuditEvent
+        session.add(AuditEvent(event_type="conflict_detected", raw_archive_id=archive_id,
+            actor="pipeline_worker", operation_metadata={"conflict_group_id":str(group.id),
+            "group_type":"duplicate","duplicate_archive_ids":[str(a) for a in other_ids],
+            "linked_fact_count":result.rowcount}))
+        detection = DuplicateDetection(group, other_ids, int(result.rowcount or 0))
+    return detection

@@ -228,6 +228,17 @@ async def _apply_bundle_tombstones(
     """
     if not isinstance(tombstones, list):
         return 0
+    # Lock ALL matching archives before entering any head/generation suppression.
+    hashes = [(t or {}).get("content_hash") for t in tombstones
+              if (t or {}).get("content_hash")]
+    locked = (await session.scalars(
+        select(RawArchiveItem).where(
+            RawArchiveItem.content_hash.in_(hashes),
+            RawArchiveItem.deleted_at.is_(None),
+        ).order_by(RawArchiveItem.id).with_for_update()
+    )).all()
+    from app.domain.derivations.privacy import lock_existing_heads
+    await lock_existing_heads(session, [row.id for row in locked])
     applied = 0
     for t in tombstones:
         content_hash = (t or {}).get("content_hash")
@@ -273,14 +284,11 @@ async def _apply_bundle_tombstones(
         # this deletion — the same treatment cascade_delete_archive_item() /
         # reapply_tombstones() give a direct delete, so a tombstoned bundle
         # import can't leave plaintext recoverable via pg_dump.
-        rows = (
-            await session.execute(
-                select(RawArchiveItem).where(
-                    RawArchiveItem.content_hash == content_hash,
-                    RawArchiveItem.deleted_at.is_(None),
-                )
-            )
-        ).scalars().all()
+        # Reuse the locked set; do not discover another unlocked archive after
+        # head/generation locks have been acquired. Duplicate ledger entries skip
+        # rows already marked deleted, just as the previous per-hash query did.
+        rows = [row for row in locked
+                if row.content_hash == content_hash and row.deleted_at is None]
         for row in rows:
             archive_id_str = str(row.id)
             row.deleted_at = datetime.now(timezone.utc)

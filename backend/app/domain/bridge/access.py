@@ -3,6 +3,7 @@
 from sqlalchemy import or_, select
 
 from app.domain.bridge.models import BridgeGrant, BridgeProject
+from app.domain.derivations.visibility import enabled
 
 
 async def permitted_spaces(session, actor, requested=None, *, write=False):
@@ -22,6 +23,7 @@ async def permitted_spaces(session, actor, requested=None, *, write=False):
         (
             await session.execute(
                 query.order_by(BridgeProject.id).with_for_update(read=True, of=BridgeProject)
+                .execution_options(populate_existing=enabled())
             )
         )
         .scalars()
@@ -40,6 +42,7 @@ async def permitted_spaces(session, actor, requested=None, *, write=False):
                 )
                 .order_by(BridgeGrant.project_id)
                 .with_for_update(read=True)
+                .execution_options(populate_existing=enabled())
             )
         )
         .scalars()

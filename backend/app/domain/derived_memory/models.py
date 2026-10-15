@@ -11,7 +11,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
-from sqlalchemy import String, Text, TIMESTAMP, ForeignKey, Enum as SAEnum, Computed, Index
+from sqlalchemy import String, Text, TIMESTAMP, ForeignKey, Enum as SAEnum, Computed, Index, UniqueConstraint
+from app.domain.derivations.models import generation_fk
 from sqlalchemy.dialects.postgresql import UUID, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
 from pgvector.sqlalchemy import Vector
@@ -51,6 +52,8 @@ class ConflictGroup(Base):
 class Summary(Base):
     """LLM-generated summary of a raw archive item."""
     __tablename__ = "summaries"
+    generation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    __table_args__ = (generation_fk('summaries'), UniqueConstraint('generation_id', name='uq_summary_generation'))
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -80,6 +83,7 @@ class Fact(Base):
     A fact without source_span must be stored with confidence_tier = 'low'.
     """
     __tablename__ = "facts"
+    generation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
@@ -122,12 +126,15 @@ class Fact(Base):
 
     __table_args__ = (
         Index("ix_facts_fts", "search_vector", postgresql_using="gin"),
+        generation_fk('facts'),
     )
 
 
 class Embedding(Base):
     """Vector embedding for a raw archive item (all-MiniLM-L6-v2, 384 dims)."""
     __tablename__ = "embeddings"
+    generation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    __table_args__ = (generation_fk('embeddings'), UniqueConstraint('generation_id', name='uq_embedding_generation'))
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), primary_key=True, default=uuid.uuid4

@@ -927,6 +927,10 @@ async def dispatch_job(session: AsyncSession, job: Job) -> None:
     On missing provider: job → pending_provider (amber badge, not failure).
     On blocked content: job → completed (no LLM output, FTS still runs).
     """
+    from app.domain.derivations.visibility import enabled
+    if enabled():
+        from app.worker.managed_dispatcher import dispatch_managed_job
+        return await dispatch_managed_job(session, job)
     from sqlalchemy import select  # noqa: PLC0415
     from app.domain.archive.models import RawArchiveItem  # noqa: PLC0415
     from app.domain.derived_memory.service import (  # noqa: PLC0415

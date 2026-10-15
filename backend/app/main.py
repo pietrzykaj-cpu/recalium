@@ -21,6 +21,7 @@ from starlette.responses import FileResponse as _FileResponse
 from starlette.exceptions import HTTPException as _StarletteHTTPException
 
 from app.api.bridge import bridge_app, bridge_mcp
+from app.domain.derivations import visibility  # noqa: F401 — register dormant reader guard
 from app.api.routes import router as api_router
 from app.api.routes.search import router as search_router
 from app.api.routes.canonical import router as canonical_router
@@ -82,6 +83,8 @@ def _assert_no_keys_in_schema() -> None:
     import app.domain.archive.models  # noqa: F401
     import app.domain.settings.models  # noqa: F401
     import app.domain.jobs.models  # noqa: F401
+    import app.domain.derivations.models  # noqa: F401
+    import app.domain.derivations.visibility  # noqa: F401 — shared dormant ORM reader guard
     import app.domain.audit.models  # noqa: F401
     import app.domain.derived_memory.models  # noqa: F401
     import app.domain.canonical_memory.models  # noqa: F401

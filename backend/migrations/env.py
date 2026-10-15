@@ -11,6 +11,11 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 # Import Base so Alembic sees all models for autogenerate.
 # Add new model imports here as modules are created.
 from app.infrastructure.db import Base  # noqa: F401 — registers metadata
+import app.domain.derivations.models  # noqa: F401
+import app.domain.jobs.models  # noqa: F401
+import app.domain.archive.models  # noqa: F401
+import app.domain.audit.models  # noqa: F401
+import app.domain.derived_memory.models  # noqa: F401
 
 config = context.config
 

@@ -172,8 +172,16 @@ async def reprocess_job(session: AsyncSession, job_id: uuid.UUID) -> Job | None:
     PIPE-05: Used by POST /api/jobs/{job_id}/reprocess endpoint.
     Resets attempts to 0 so it gets full max_attempts retries.
     Reject all other statuses without mutation, particularly an in-flight claim.
-    Revisit completed jobs only once Slice 1 can create a new derivation generation.
+    Revisit completed jobs only at the separately authorized/certified Slice 1C gate.
     """
+    from app.domain.derivations.visibility import enabled
+    if enabled():
+        from app.domain.derivations.service import admit_generation, DerivationConflict
+        try:
+            generation = await admit_generation(session, job_id, manual=True)
+        except DerivationConflict as exc:
+            raise ReprocessConflict('Job cannot be reprocessed in its current state') from exc
+        return await session.get(Job, job_id, populate_existing=True) if generation is not None else None
     result = await session.execute(
         select(Job)
         .where(Job.id == job_id)

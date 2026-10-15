@@ -263,6 +263,12 @@ async def restore_backup(
     # 2. Validate the archive before mutating the active database.
     await _validate_archive(filepath)
 
+    # Preserve R1 before destructive restore; compatible reconciliation is 1C.
+    from app.infrastructure.db import get_session_factory
+    from app.domain.derivations.privacy import assert_restore_safe
+    async with get_session_factory()() as retirement_session:
+        await assert_restore_safe(retirement_session)
+
     # 3. Pre-restore safety snapshot for rollback.
     snapshot = Path(backup_dir) / (
         f".rollback_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S_%f')}.dump"
