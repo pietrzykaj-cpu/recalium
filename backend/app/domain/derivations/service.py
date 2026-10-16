@@ -58,6 +58,16 @@ class DerivationConflict(Exception):
         super().__init__((message or reason.value) if isinstance(reason, ConflictReason)
                          else "Unknown derivation conflict")
 
+
+class CompletedReprocessMismatch(Exception):
+    """Manual CAS failure only; not a worker coordination outcome."""
+    def __init__(self, job):
+        self.current_generation_id = job.generation_id
+        self.current_status = job.status if job.status in {
+            "pending", "claimed", "completed", "failed", "retryable_failed", "pending_provider"
+        } else "unsupported"
+        super().__init__("expected_generation_mismatch")
+
 @dataclass(frozen=True)
 class Claim:
     job_id: uuid.UUID
@@ -175,7 +185,77 @@ async def context(session, claim):
         raise DerivationConflict(reason)
     return source, head, job, gen, generations
 
-async def admit_generation(session, job_id, *, manual=False, expected_claim=None):
+
+async def _new_generation(session, source, job, generations, predecessor, *, manual):
+    """Shared identity/succession construction; head assignment is the caller's duty."""
+    generation = Generation(raw_archive_id=source.id, original_job_id=job.id,
+        sequence=max((g.sequence for g in generations), default=0)+1,
+        creation_reason="manual_reprocess" if manual else "automatic_processing",
+        source_content_hash=source.content_hash, predecessor_generation_id=predecessor)
+    session.add(generation)
+    await session.flush()
+    job.generation_id = generation.id
+    if manual:
+        job.status, job.attempts, job.error_message = "pending", 0, None
+        job.updated_at = datetime.now(timezone.utc)
+    return generation
+
+
+async def admit_completed_generation(session, job_id, expected_generation):
+    """Explicit completed CAS with ordinary candidate attachment, never publication.
+
+    Existing archive/head locking creates a blank head when needed. Candidate,
+    generation and job reset commit together; active/retirement stay unchanged.
+    Existing PR18 manual reset remains separate.
+    """
+    require_enabled()
+    if expected_generation != "legacy" and not isinstance(expected_generation, uuid.UUID):
+        raise DerivationConflict(ConflictReason.INVALID_PHASE)
+    aid = await session.scalar(select(Job.raw_archive_id).where(Job.id == job_id)
+        .execution_options(autoflush=False))
+    await session.rollback()
+    if aid is None:
+        return None
+    async with transaction(session):
+        source, head, job, jobs, gens = await locked_state(session, aid, job_id, create_head=True)
+        if job is None:
+            # A lost job must not commit the newly inserted blank head on 404.
+            await session.rollback()
+            return None
+        if job.raw_archive_id != aid:
+            raise DerivationConflict(ConflictReason.STATE_INCONSISTENT)
+        expected = None if expected_generation == "legacy" else expected_generation
+        # Check before status: a lost-ack replay is fenced even after claim/finish.
+        if job.generation_id != expected:
+            raise CompletedReprocessMismatch(job)
+        if job.status != "completed":
+            raise DerivationConflict(ConflictReason.INVALID_PHASE)
+        require_enabled()
+        if not await source_live(session, source):
+            raise DerivationConflict(ConflictReason.SOURCE_REMOVED)
+        if head is None or len(jobs) != 1 or any(g.original_job_id != job.id for g in gens):
+            raise DerivationConflict(ConflictReason.STATE_INCONSISTENT)
+        if job.generation_id is None:
+            if gens or (head and (head.active_generation_id is not None
+                    or head.candidate_generation_id is not None or head.legacy_retired_at is not None)):
+                raise DerivationConflict(ConflictReason.STATE_INCONSISTENT)
+            predecessor = None  # Never invent legacy derivation provenance.
+        else:
+            gen = next((g for g in gens if g.id == job.generation_id), None)
+            if (gen is None or head is None or gen.status != "active"
+                or head.active_generation_id != gen.id or head.candidate_generation_id is not None
+                or gen.contract_version != 1 or gen.source_content_hash != source.content_hash
+                or any(g.status in {"building", "prepared"} for g in gens)
+                or sum(g.status == "active" for g in gens) != 1):
+                raise DerivationConflict(ConflictReason.STATE_INCONSISTENT)
+            await validate_publication(session, head, gen)
+            predecessor = gen.id
+        result = await _new_generation(session, source, job, gens, predecessor, manual=True)
+        head.candidate_generation_id = result.id
+        job.completed_at = None
+    return result
+
+async def admit_generation(session, job_id, *, manual=False, expected_claim=None, expected_generation=None):
     require_enabled()
     if not manual and (expected_claim is None or expected_claim.job_id != job_id):
         raise DerivationConflict(ConflictReason.INVALID_PHASE, "Automatic admission requires captured claim")
@@ -196,6 +276,10 @@ async def admit_generation(session, job_id, *, manual=False, expected_claim=None
             raise DerivationConflict(ConflictReason.CLAIM_LOST)
         if job.raw_archive_id != aid:
             raise DerivationConflict(ConflictReason.CLAIM_LOST)
+        if manual and expected_generation is not None:
+            expected = None if expected_generation == "legacy" else expected_generation
+            if job.generation_id != expected:
+                raise CompletedReprocessMismatch(job)
         if not await source_live(session, source):
             raise DerivationConflict(ConflictReason.SOURCE_REMOVED)
         if manual and job.status not in {"failed", "retryable_failed", "pending_provider"}:
@@ -229,17 +313,8 @@ async def admit_generation(session, job_id, *, manual=False, expected_claim=None
                 candidate.status = "abandoned"
                 head.candidate_generation_id = None
                 await session.flush()
-            result = Generation(raw_archive_id=aid, original_job_id=job.id,
-                sequence=max((g.sequence for g in gens), default=0)+1,
-                creation_reason="manual_reprocess" if manual else "automatic_processing",
-                source_content_hash=source.content_hash, predecessor_generation_id=head.active_generation_id)
-            session.add(result)
-            await session.flush()
-            job.generation_id = result.id
+            result = await _new_generation(session, source, job, gens, head.active_generation_id, manual=manual)
             head.candidate_generation_id = result.id
-            if manual:
-                job.status, job.attempts, job.error_message = "pending", 0, None
-                job.updated_at = datetime.now(timezone.utc)
     return result
 
 async def stage(session, generation_id, name):
