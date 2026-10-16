@@ -324,7 +324,8 @@ async def prepare_fts(session, claim, text_content, projection_kind):
 async def validate_publication(session, head, gen):
     """One durable definition, shared by publication and managed replay resolution.
 
-    Caller holds archive/head/job/generation locks. This does not mutate state.
+    Writers hold archive/head/job/generation locks. The read-only cutover checker
+    instead uses one coherent REPEATABLE READ snapshot. This does not mutate state.
     Optional enrichment is deliberately not a publication prerequisite.
     """
     projection = await session.scalar(select(Projection).where(Projection.generation_id == gen.id))

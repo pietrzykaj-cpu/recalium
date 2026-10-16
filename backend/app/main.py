@@ -124,6 +124,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logging.basicConfig(level=log_level, format="%(levelname)s [%(name)s] %(message)s")
 
     logger.info(f"Starting Recalium in {settings.app_env} mode")
+    logger.info("generation_idempotency_enabled=%s", settings.generation_idempotency_enabled is True)
 
     # Security: enforce auth bearer when binding beyond localhost
     if settings.requires_auth and not settings.app_auth_bearer:
