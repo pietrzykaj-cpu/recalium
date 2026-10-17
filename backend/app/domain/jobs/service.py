@@ -24,6 +24,11 @@ _STALE_THRESHOLD_MINUTES = 10
 
 class ReprocessConflict(Exception):
     """The job's locked current status does not allow manual reprocessing."""
+    def __init__(self, message, *, reason=None, current_generation_id=None, current_status=None):
+        super().__init__(message)
+        self.reason = reason
+        self.current_generation_id = current_generation_id
+        self.current_status = current_status
 
 
 async def claim_next_job(session: AsyncSession) -> Job | None:
@@ -166,19 +171,47 @@ async def reset_stale_jobs(session: AsyncSession) -> int:
     return count
 
 
-async def reprocess_job(session: AsyncSession, job_id: uuid.UUID) -> Job | None:
+async def reprocess_job(
+    session: AsyncSession, job_id: uuid.UUID, *, expected_generation: Literal["legacy"] | uuid.UUID | None = None,
+) -> Job | None:
     """Reset a failed, retryable_failed, or pending_provider job for manual re-queue.
 
     PIPE-05: Used by POST /api/jobs/{job_id}/reprocess endpoint.
     Resets attempts to 0 so it gets full max_attempts retries.
-    Reject all other statuses without mutation, particularly an in-flight claim.
-    Revisit completed jobs only at the separately authorized/certified Slice 1C gate.
+    Reject other statuses without mutation, particularly an in-flight claim.
+    Explicit legacy/UUID preconditions additionally allow completed managed reprocess.
+    Omitted/null is never a legacy-generation precondition; PR18 stays unchanged.
     """
     from app.domain.derivations.visibility import enabled
-    if enabled():
-        from app.domain.derivations.service import admit_generation, DerivationConflict
+    managed_enabled = enabled()
+    if not managed_enabled and expected_generation is not None:
+        # Generation-aware fences are never silently ignored by the legacy reset.
+        # Roll back any caller transaction/dirty cache without flushing changes.
+        await session.rollback()
+        raise ReprocessConflict("Generation-aware reprocess is disabled",
+            reason="generation_reprocess_disabled")
+    if managed_enabled:
+        from app.domain.derivations.service import (
+            admit_generation, admit_completed_generation, CompletedReprocessMismatch, DerivationConflict,
+        )
         try:
-            generation = await admit_generation(session, job_id, manual=True)
+            if expected_generation is None:
+                generation = await admit_generation(session, job_id, manual=True)
+            else:
+                # Routing only, never authorization: both coordinator paths lock,
+                # refresh and validate status/binding again before any mutation.
+                status = await session.scalar(select(Job.status).where(Job.id == job_id)
+                    .execution_options(autoflush=False))
+                await session.rollback()
+                if status in {"failed", "retryable_failed", "pending_provider"}:
+                    generation = await admit_generation(session, job_id, manual=True,
+                        expected_generation=expected_generation)
+                else:
+                    generation = await admit_completed_generation(session, job_id, expected_generation)
+        except CompletedReprocessMismatch as exc:
+            raise ReprocessConflict("Expected generation binding mismatch",
+                reason="expected_generation_mismatch", current_generation_id=exc.current_generation_id,
+                current_status=exc.current_status) from exc
         except DerivationConflict as exc:
             raise ReprocessConflict('Job cannot be reprocessed in its current state') from exc
         return await session.get(Job, job_id, populate_existing=True) if generation is not None else None
