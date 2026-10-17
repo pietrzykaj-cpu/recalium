@@ -2,6 +2,7 @@
 from contextvars import ContextVar
 from sqlalchemy import text
 from app.domain.derivations.visibility import enabled
+from app.infrastructure.local_model import LocalModelNotReady
 
 prepared_query = ContextVar("derivation_prepared_query", default=None)
 
@@ -13,7 +14,7 @@ async def prepare_query(query, mode, *, canonical_only=False):
         from app.domain.derived_memory.service import embed_text
         try:
             vector = await embed_text(query)
-        except RuntimeError:
+        except (RuntimeError, LocalModelNotReady):
             degraded = True
     return query, vector, degraded
 

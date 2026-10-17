@@ -29,6 +29,7 @@ from app.domain.derivations.visibility import enabled, current_sql
 from app.domain.audit.models import AuditEvent
 from app.domain.derived_memory.service import ACTIVE_EMBEDDING_MODEL
 from app.domain.retrieval.diagnostics import MetadataMergeDiagnostic, RetrievalDiagnosticsCollector
+from app.infrastructure.local_model import LocalModelNotReady
 
 logger = logging.getLogger(__name__)
 
@@ -686,8 +687,8 @@ async def _semantic_candidates(
         from app.domain.derived_memory.service import embed_text
         if not enabled():
             query_vector = await embed_text(query)
-    except RuntimeError:
-        logger.info("Semantic search unavailable: sentence-transformers not installed (degraded mode)")
+    except (RuntimeError, LocalModelNotReady):
+        logger.info("Semantic embedding unavailable (degraded mode)")
         return [], True
 
     # Build optional tag filter clause

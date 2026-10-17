@@ -3,6 +3,7 @@ import logging
 from dataclasses import replace
 from app.domain.derivations import service as g
 from app.infrastructure.settings import get_settings
+from app.infrastructure.local_model import LocalModelNotReady
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,12 @@ async def dispatch_managed_job(session, job):
                 if inputs["status"] == "active":
                     raise g.DerivationConflict(g.ConflictReason.ALREADY_PUBLISHED)
                 await dispatch_claim(session, claim, inputs)
+            return
+        except LocalModelNotReady:
+            # Expected readiness failure, not a coordination outcome or crash.
+            # Claim already consumed its normal attempt; no refund/cooldown.
+            await g.fail_current_claim(session, claim.job_id, claim.attempts, claim.claimed_at,
+                generation_id=claim.generation_id, error="local_model_not_ready", retryable=False)
             return
         except g.DerivationConflict as conflict:
             outcome = await g.resolve_conflict(session, claim, conflict)

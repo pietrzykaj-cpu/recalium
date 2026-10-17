@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from app.infrastructure.local_model import MODEL_NAME, LocalModelNotReady, load_local_model
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ _RELATIONSHIP_KEYWORDS = frozenset([
 # per-category prototype sentences with the same MiniLM model used for
 # embeddings separates cleanly (measured 2026-07-08 against the eval dataset).
 
-_GATE_EMBED_MODEL_NAME = "all-MiniLM-L6-v2"  # same model as derived_memory embeddings
+_GATE_EMBED_MODEL_NAME = MODEL_NAME  # shared pinned local asset contract
 
 _CATEGORY_PROTOTYPES: dict[str, list[str]] = {
     "personal_profile": [
@@ -102,16 +103,18 @@ def _get_gate_model():
     global _gate_model, _prototype_embeddings
     if _gate_model is None:
         try:
-            from sentence_transformers import SentenceTransformer  # noqa: PLC0415
-            _gate_model = SentenceTransformer(_GATE_EMBED_MODEL_NAME)
-            _prototype_embeddings = {
-                category: _gate_model.encode(sentences, normalize_embeddings=True)
+            model = load_local_model()
+            prototypes = {
+                category: model.encode(sentences, normalize_embeddings=True)
                 for category, sentences in _CATEGORY_PROTOTYPES.items()
             }
-            logger.info("Loaded sensitivity gate model: %s", _GATE_EMBED_MODEL_NAME)
-        except Exception as e:
-            logger.error("Failed to load sensitivity gate model: %s", e)
-            raise
+        except Exception:
+            logger.error("Failed to load sensitivity gate model: local_model_not_ready")
+            raise LocalModelNotReady() from None
+        # Publish only a complete initialization; failure must leave no cached
+        # half-model that prevents a later call from retrying the prototypes.
+        _gate_model, _prototype_embeddings = model, prototypes
+        logger.info("Loaded sensitivity gate model: %s", _GATE_EMBED_MODEL_NAME)
     return _gate_model
 
 
@@ -258,6 +261,11 @@ class SensitivityGate:
         # Pass 2: embedding inference in thread pool (CPU-bound — must not block event loop)
         try:
             return await asyncio.to_thread(self._embedding_classify, text)
+        except LocalModelNotReady:
+            # Unavailable local model is an execution failure, not a sensitivity
+            # classification. Existing dispatchers fail the claim; never publish
+            # policy-skipped output merely because the gate could not load.
+            raise
         except Exception as e:
             logger.error(
                 "Embedding classification failed: %s — defaulting to unclassified (blocked)", e

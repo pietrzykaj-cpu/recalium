@@ -17,6 +17,16 @@ from app.infrastructure.settings import get_settings
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture
+def ready_local_assets(monkeypatch):
+    # These publication/privacy tests do not load models. Locality readiness
+    # itself is validated separately using real static file checks.
+    from app.domain.derivations import service as g
+    async def ready():
+        return None
+    monkeypatch.setattr(g, 'require_local_model_ready_async', ready)
+
+
 @pytest_asyncio.fixture
 async def schema(db_session, monkeypatch):
     monkeypatch.setattr(get_settings(), 'generation_idempotency_enabled', False)
@@ -190,7 +200,7 @@ async def test_orphan_job_and_partition_proof_fail_closed(db_session, schema, mo
     assert 'partition_mismatch' in result['blockers']
 
 
-async def test_active_class_calls_real_shared_publication_validator(db_session, schema, monkeypatch):
+async def test_active_class_calls_real_shared_publication_validator(db_session, schema, monkeypatch, ready_local_assets):
     from app.domain.derivations import service as g
     from tests.domain.test_derivation_generations import claimed
     from tests.domain.test_derivation_boundaries import build
@@ -509,7 +519,7 @@ async def test_baseline_only_readers_and_window_a_rollback(db_session, client, s
 
 @pytest.mark.parametrize('managed_generation', [False, True], ids=['legacy-off', 'published-managed'])
 async def test_class_d_real_derived_privacy_and_plaintext_rejection(
-    db_session, schema, monkeypatch, tmp_path, managed_generation,
+    db_session, schema, monkeypatch, tmp_path, managed_generation, ready_local_assets,
 ):
     """N2: real nonempty derived rows, real deletion, then deliberate corruption.
 
