@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     summarize_model: str = "auto"
     extract_model: str = "auto"
     embed_model: str = "all-MiniLM-L6-v2"
+    # Immutable approved MiniLM snapshot; no remote/cache resolution fallback.
+    local_model_assets_dir: str = "/app/local-models/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
 
     # Per-function provider routing (F2, BYOK-08) — "auto" | "openai" |
     # "anthropic" | "ollama". "auto" falls back to the first configured key

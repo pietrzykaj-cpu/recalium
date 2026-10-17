@@ -54,6 +54,12 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       GENERATION_IDEMPOTENCY_ENABLED: ${GENERATION_IDEMPOTENCY_ENABLED:-false}
       EMBED_BACKEND: ${EMBED_BACKEND:-cpu}
+      # Prospective offline MiniLM contract; asset provisioning/recreate is a
+      # separate operator gate. Never fetch missing assets at runtime.
+      LOCAL_MODEL_ASSETS_DIR: ${LOCAL_MODEL_ASSETS_DIR:-/app/local-models/all-MiniLM-L6-v2/1110a243fdf4706b3f48f1d95db1a4f5529b4d41}
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
@@ -70,6 +76,12 @@ services:
     volumes:
       - ./backups:/backups
       - ./import:/app/import
+      - type: bind
+        source: ${LOCAL_MODEL_ASSETS_HOST_DIR:-./data/local-models}
+        target: /app/local-models
+        read_only: true
+        bind:
+          create_host_path: false
     networks:
       - recalium-net
     entrypoint: ["/app/entrypoint.sh"]

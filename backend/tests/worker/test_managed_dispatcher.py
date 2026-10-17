@@ -14,6 +14,10 @@ def spies(monkeypatch, db_session):
     from app.domain.policy.gate import SensitivityDecision
     import app.domain.derived_memory.service as writers
     monkeypatch.setattr(get_settings(), "generation_idempotency_enabled", True)
+    from app.domain.derivations import service as g
+    async def ready():
+        assert not db_session.in_transaction()
+    monkeypatch.setattr(g, "require_local_model_ready_async", ready)
     async def gate(raw):
         assert not db_session.in_transaction()
         return SensitivityDecision(category="general", confidence=0.9, blocked=False, method="test")

@@ -11,6 +11,12 @@ from app.infrastructure.settings import get_settings
 @pytest.fixture
 def managed(monkeypatch):
     monkeypatch.setattr(get_settings(), "generation_idempotency_enabled", True)
+    # Lifecycle tests inject ready assets, never load an ML model. Real static
+    # readiness and rejection/no-mutation are exercised in test_local_model_admission.
+    from app.domain.derivations import service as g
+    async def ready():
+        return None
+    monkeypatch.setattr(g, "require_local_model_ready_async", ready)
 
 async def claimed(session):
     source = RawArchiveItem(source_type="test", raw_content="unique alpha source", content_hash=uuid.uuid4().hex)

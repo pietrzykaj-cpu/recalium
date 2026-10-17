@@ -11,6 +11,7 @@ from app.domain.jobs.models import Job
 from app.domain.derived_memory.models import Fact, Summary, Embedding
 from app.domain.derivations.models import ArchiveDerivationHead as Head, DerivationGeneration as Generation, DerivationStageCompletion as Completion, DerivationFtsProjection as Projection
 from app.domain.derivations.visibility import enabled, HISTORY
+from app.infrastructure.local_model import require_local_model_ready_async
 
 class ConflictReason(str, Enum):
     CLAIM_LOST = "claim_lost"
@@ -216,6 +217,10 @@ async def admit_completed_generation(session, job_id, expected_generation):
     await session.rollback()
     if aid is None:
         return None
+    # Gate uses local MiniLM even for externally permitted policy paths. All
+    # managed admissions therefore require the same ready local assets. No DB
+    # transaction/lock spans hashing, and no head/gen/job mutation precedes it.
+    await require_local_model_ready_async()
     async with transaction(session):
         source, head, job, jobs, gens = await locked_state(session, aid, job_id, create_head=True)
         if job is None:
@@ -267,6 +272,7 @@ async def admit_generation(session, job_id, *, manual=False, expected_claim=None
         return None
     if not manual and aid != expected_claim.archive_id:
         raise DerivationConflict(ConflictReason.CLAIM_LOST)
+    await require_local_model_ready_async()
     result = None
     async with transaction(session):
         source, head, job, jobs, gens = await locked_state(session, aid, job_id, create_head=True)

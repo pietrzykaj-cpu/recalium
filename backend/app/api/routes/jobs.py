@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.domain.jobs.service import ReprocessConflict, reprocess_job
 from app.infrastructure.db import get_session
+from app.infrastructure.local_model import LocalModelNotReady
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -46,6 +47,8 @@ async def reprocess_job_endpoint(
     try:
         job = await reprocess_job(session, job_id,
             expected_generation=body.expected_generation if body is not None else None)
+    except LocalModelNotReady:
+        raise HTTPException(status_code=503, detail="local_model_not_ready") from None
     except ReprocessConflict as exc:
         detail = "Job cannot be reprocessed in its current state"
         if exc.reason == "expected_generation_mismatch":

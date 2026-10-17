@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from importlib.util import find_spec
+from app.infrastructure.local_model import MODEL_NAME, load_local_model
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -26,8 +28,7 @@ logger = logging.getLogger(__name__)
 # _get_embed_model() is called inside asyncio.to_thread() — safe to block there.
 # Will be None if sentence-transformers is not installed (EMBED_BACKEND=none).
 try:
-    from sentence_transformers import SentenceTransformer as _SentenceTransformer
-    _SENTENCE_TRANSFORMERS_AVAILABLE = True
+    _SENTENCE_TRANSFORMERS_AVAILABLE = find_spec("sentence_transformers") is not None
 except ImportError:
     _SentenceTransformer = None  # type: ignore[assignment,misc]
     _SENTENCE_TRANSFORMERS_AVAILABLE = False
@@ -36,8 +37,9 @@ except ImportError:
         "Local embeddings unavailable — use OpenAI / Anthropic / Ollama instead."
     )
 
-_embed_model: "_SentenceTransformer | None" = None
-_EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+_SentenceTransformer = None  # optional factory seam; never import ML eagerly
+_embed_model = None
+_EMBED_MODEL_NAME = MODEL_NAME
 # Public, canonical name of the embedding model that produced the vectors in the
 # `embeddings` table. Write, retrieval, and provenance MUST reference this single
 # constant so they can never drift (GPT5.6 #21). Changing it requires a re-embed
@@ -55,7 +57,7 @@ def _get_embed_model() -> "_SentenceTransformer":
         )
     global _embed_model
     if _embed_model is None:
-        _embed_model = _SentenceTransformer(_EMBED_MODEL_NAME)
+        _embed_model = load_local_model(factory=_SentenceTransformer)
         logger.info("Loaded embedding model: %s", _EMBED_MODEL_NAME)
     return _embed_model
 
