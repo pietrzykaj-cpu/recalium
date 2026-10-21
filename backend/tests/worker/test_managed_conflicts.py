@@ -434,3 +434,48 @@ async def test_admission_fences_each_captured_field(db_session, spies, field):
         await g.admit_generation(db_session, job.id, expected_claim=replace(claim, **{field: bad[field]}))
     assert await db_session.scalar(text("SELECT count(*) FROM archive_derivation_heads")) == 0
     assert await db_session.scalar(text("SELECT count(*) FROM derivation_generations")) == 0
+
+
+async def test_slice2a_crash_after_conflict_stage_replay_creates_exactly_one_group(db_session, spies, monkeypatch):
+    """Slice 2A: conflict stage committed, crash before finalization, PR #14 recovery + re-dispatch."""
+    from app.domain.derived_memory import service as writers
+    from app.domain.derived_memory.models import Embedding
+    from app.worker import dispatcher as legacy
+    from app.domain.jobs.service import recover_claimed_job_after_dispatch_failure, claim_next_job
+    vector = [1.0] + [0.0] * 383
+    partner = RawArchiveItem(source_type="test", raw_content="beta partner", content_hash=uuid.uuid4().hex)
+    db_session.add(partner)
+    await db_session.commit()
+    pid = partner.id
+    await writers.write_facts(db_session, pid, [{"fact_text": "beta partner"}])
+    db_session.add(Embedding(raw_archive_id=pid, embedding=vector, embedding_model=writers.ACTIVE_EMBEDDING_MODEL))
+    await db_session.commit()
+    async def embed(raw):
+        assert not db_session.in_transaction()
+        return vector
+    async def no_typed_link(*args, **kwargs):
+        return None
+    monkeypatch.setattr(writers, "embed_text", embed)
+    monkeypatch.setattr(legacy, "_classify_link_pair", no_typed_link)
+    job = await job_row(db_session)
+    jid = job.id
+    async def crash(*args, **kwargs):
+        raise RuntimeError("synthetic crash after conflict stage")
+    with monkeypatch.context() as patch:
+        patch.setattr(g, "finish_claim", crash)
+        with pytest.raises(RuntimeError):
+            await legacy.dispatch_job(db_session, job)
+    await db_session.rollback()
+    async def identity_counts():
+        return tuple([await db_session.scalar(text(f"SELECT count(*) FROM {t}")) for t in (
+            "conflict_groups", "review_queue_items", "conflict_detection_runs", "conflict_group_members")])
+    assert await identity_counts() == (1, 1, 1, 2)
+    current = await db_session.get(Job, jid, populate_existing=True)
+    assert await recover_claimed_job_after_dispatch_failure(
+        db_session, jid, current.attempts, current.claimed_at, RuntimeError("synthetic crash")) == "recovered"
+    next_job = await claim_next_job(db_session)
+    assert next_job.id == jid
+    await legacy.dispatch_job(db_session, next_job)
+    assert (await db_session.get(Job, jid, populate_existing=True)).status == "completed"
+    assert await identity_counts() == (1, 1, 1, 2)
+    assert spies[1].await_count == spies[2].await_count == 1

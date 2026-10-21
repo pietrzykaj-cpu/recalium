@@ -22,6 +22,10 @@ logger = logging.getLogger(__name__)
 
 DUPLICATE_DISTANCE_THRESHOLD = 0.15
 _MAX_CANDIDATES = 10
+# Slice 2A: identity of the managed detection contract (threshold, candidate cap,
+# archive-wide grouping, link predicate). Changing any of them requires a bump, which
+# deliberately permits exactly one new detection run per generation.
+DETECTION_CONTRACT_VERSION = 1
 
 
 async def find_duplicate_candidates(
@@ -148,6 +152,7 @@ async def detect_and_group_duplicates(
     raw_archive_id: uuid.UUID,
     embedding_id: uuid.UUID,
     embedding: list[float],
+    generation_id: uuid.UUID | None = None,
 ) -> DuplicateDetection | None:
     """Detect near-duplicate embeddings and, if any, create + populate a group.
 
@@ -158,9 +163,15 @@ async def detect_and_group_duplicates(
 
     Returns a ``DuplicateDetection`` (group + involved items + linked fact count)
     or ``None`` when no other item is a near-duplicate.
+
+    Slice 2A: under R2 the managed caller must pass ``generation_id`` (the trigger
+    generation); detection then runs at most once per (generation, contract version).
     """
     if enabled():
-        return await _detect_current_generations(session, raw_archive_id, embedding_id, embedding)
+        if generation_id is None:
+            raise ValueError("Managed conflict detection requires the trigger generation_id")
+        return await _detect_current_generations(
+            session, raw_archive_id, embedding_id, embedding, generation_id)
     candidates = await find_duplicate_candidates(
         session, embedding=embedding, exclude_id=embedding_id
     )
@@ -190,37 +201,77 @@ async def detect_and_group_duplicates(
         linked_fact_count=linked,
     )
 
-async def _detect_current_generations(session, archive_id, embedding_id, vector):
-    """Visibility/fencing only; intentionally NOT conflict/review replay identity."""
+async def _recorded_run(session, generation_id, *, fresh=False):
+    """Slice 2A: the recorded detection run for this generation and contract version, if any."""
+    from app.domain.derived_memory.models import ConflictDetectionRun
+    statement = select(ConflictDetectionRun).where(
+        ConflictDetectionRun.generation_id == generation_id,
+        ConflictDetectionRun.contract_version == DETECTION_CONTRACT_VERSION)
+    if fresh:
+        statement = statement.execution_options(populate_existing=True)
+    return await session.scalar(statement)
+
+
+async def _detect_current_generations(session, archive_id, embedding_id, vector, generation_id):
+    """Visibility/fencing plus Slice 2A replay identity (one result per generation and contract).
+
+    Not pair identity (Slice 2B): a later archive near an already-decided pair can still
+    regroup their unlinked facts.
+    """
     from app.domain.derivations import service as g
+    from app.domain.derived_memory.models import ConflictDetectionRun, ConflictGroupMember
     from app.domain.review_queue.service import materialize_review_item
     async with g.transaction(session):
+        # Replay identity first: a recorded run means this generation was already
+        # detected under this contract. Plain read before any lock or write (the lock
+        # helper below inserts heads), so a replay writes nothing at all.
+        if await _recorded_run(session, generation_id) is not None:
+            return None
         candidates = await find_duplicate_candidates(session, vector, embedding_id)
         other_ids = await _resolve_embedding_archive_ids(session, candidates)
         sources,_ = await g.lock_archives_and_heads(session, [archive_id, *other_ids])
         if not all([await g.source_live(session,s) for s in sources.values()]):
             return None
         own = await session.scalar(select(Embedding).where(Embedding.id == embedding_id,
-            Embedding.raw_archive_id == archive_id, Embedding.source_status == "active"))
+            Embedding.raw_archive_id == archive_id, Embedding.source_status == "active",
+            Embedding.generation_id == generation_id))
         if own is None:
             return None
+        # Locked re-check: a concurrent run for this generation committed meanwhile.
+        if await _recorded_run(session, generation_id, fresh=True) is not None:
+            return None
+        def record(outcome, group_id=None, audit_id=None):
+            session.add(ConflictDetectionRun(generation_id=generation_id, raw_archive_id=archive_id,
+                contract_version=DETECTION_CONTRACT_VERSION, outcome=outcome,
+                conflict_group_id=group_id, audit_event_id=audit_id))
         fresh = (await session.scalars(select(Embedding).where(
             Embedding.id.in_(candidates), Embedding.source_status == "active"))).all()
         other_ids = sorted({e.raw_archive_id for e in fresh if e.raw_archive_id != archive_id}, key=str)
         if not other_ids:
+            record("no_candidates")
+            return None
+        to_link = (await session.scalars(select(Fact).where(
+            Fact.raw_archive_id.in_([archive_id,*other_ids]), Fact.source_status=="active",
+            Fact.review_status=="active", Fact.conflict_group_id.is_(None)).order_by(Fact.id))).all()
+        if not to_link:
+            record("nothing_to_link")
             return None
         group = ConflictGroup(group_type="duplicate")
         session.add(group)
         await session.flush()
-        result = await session.execute(update(Fact).where(
-            Fact.raw_archive_id.in_([archive_id,*other_ids]), Fact.source_status=="active",
-            Fact.review_status=="active", Fact.conflict_group_id.is_(None))
+        session.add_all([ConflictGroupMember(conflict_group_id=group.id, fact_id=f.id,
+            raw_archive_id=f.raw_archive_id, generation_id=f.generation_id) for f in to_link])
+        await session.flush()
+        result = await session.execute(update(Fact).where(Fact.id.in_([f.id for f in to_link]))
             .values(conflict_group_id=group.id))
         await materialize_review_item(session, group.id, "duplicate")
         from app.domain.audit.models import AuditEvent
-        session.add(AuditEvent(event_type="conflict_detected", raw_archive_id=archive_id,
+        audit = AuditEvent(event_type="conflict_detected", raw_archive_id=archive_id,
             actor="pipeline_worker", operation_metadata={"conflict_group_id":str(group.id),
             "group_type":"duplicate","duplicate_archive_ids":[str(a) for a in other_ids],
-            "linked_fact_count":result.rowcount}))
+            "linked_fact_count":result.rowcount})
+        session.add(audit)
+        await session.flush()
+        record("grouped", group.id, audit.id)
         detection = DuplicateDetection(group, other_ids, int(result.rowcount or 0))
     return detection

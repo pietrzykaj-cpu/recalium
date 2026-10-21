@@ -153,7 +153,7 @@ async def enrich_and_finish(session, claim, *, allow_external):
             row = await session.scalar(select(Embedding).where(Embedding.generation_id == claim.generation_id))
             # No model call in duplicate detection. Fence all involved sources.
             await detect_and_group_duplicates(session, raw_archive_id=claim.archive_id,
-                embedding_id=row.id, embedding=inputs["embedding"])
+                embedding_id=row.id, embedding=inputs["embedding"], generation_id=claim.generation_id)
     except g.DerivationConflict:
         raise
     except Exception as exc:
