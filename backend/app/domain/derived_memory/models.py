@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from sqlalchemy import String, Text, TIMESTAMP, ForeignKey, Enum as SAEnum, Computed, Index, UniqueConstraint
+from sqlalchemy import CheckConstraint, ForeignKeyConstraint, Integer, text
 from app.domain.derivations.models import generation_fk
 from sqlalchemy.dialects.postgresql import UUID, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
@@ -263,4 +264,68 @@ class MemoryLink(Base):
     # 'pipeline_semantic' | 'pipeline_llm' | 'pipeline_entity' | 'user_ui'
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+
+
+class ConflictDetectionRun(Base):
+    """Slice 2A: at most one managed detection result per (trigger generation, contract version).
+
+    Written once by conflict detection; never updated or deleted. Ids only, no text.
+    """
+    __tablename__ = "conflict_detection_runs"
+
+    generation_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    raw_archive_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    contract_version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    outcome: Mapped[str] = mapped_column(String(16), nullable=False)
+    # "grouped" | "no_candidates" | "nothing_to_link"
+    conflict_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conflict_groups.id"), nullable=True
+    )
+    audit_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("audit_events.id"), nullable=True
+    )
+    completed_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ["generation_id", "raw_archive_id"],
+            ["derivation_generations.id", "derivation_generations.raw_archive_id"],
+            name="fk_detection_generation_archive",
+        ),
+        CheckConstraint("contract_version > 0", name="ck_detection_version"),
+        CheckConstraint("outcome IN ('grouped','no_candidates','nothing_to_link')", name="ck_detection_outcome"),
+        CheckConstraint(
+            "(outcome = 'grouped') = (conflict_group_id IS NOT NULL AND audit_event_id IS NOT NULL)",
+            name="ck_detection_grouped",
+        ),
+        Index("uq_detection_group", "conflict_group_id", unique=True,
+              postgresql_where=text("conflict_group_id IS NOT NULL")),
+    )
+
+
+class ConflictGroupMember(Base):
+    """Slice 2A: immutable membership history of a conflict group, written at grouping time.
+
+    Resolution clears facts.conflict_group_id but never touches these rows. Ids only, no text.
+    generation_id NULL = legacy fact.
+    """
+    __tablename__ = "conflict_group_members"
+
+    conflict_group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("conflict_groups.id"), primary_key=True
+    )
+    fact_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("facts.id"), primary_key=True)
+    raw_archive_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("raw_archive.id"), nullable=False
+    )
+    generation_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        Index("ix_conflict_group_members_fact", "fact_id"),
     )
