@@ -237,7 +237,7 @@ async def schema_state(session):
     if await session.scalar(text("SELECT to_regclass('alembic_version')")):
         current = list((await session.scalars(text('SELECT version_num FROM alembic_version ORDER BY version_num'))).all())
     expected = deployed_head()
-    return {'deployed_head': expected, 'current': current}, current == [expected] == ['0013']
+    return {'deployed_head': expected, 'current': current}, current == [expected]
 
 
 async def inspect_population(session, *, kind='plan', cutover=False):
