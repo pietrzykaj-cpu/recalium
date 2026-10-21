@@ -32,7 +32,8 @@ async def schema(db_session, monkeypatch):
     monkeypatch.setattr(get_settings(), 'generation_idempotency_enabled', False)
     await db_session.execute(text('CREATE TABLE IF NOT EXISTS alembic_version (version_num varchar(32) NOT NULL PRIMARY KEY)'))
     await db_session.execute(text('DELETE FROM alembic_version'))
-    await db_session.execute(text("INSERT INTO alembic_version VALUES ('0013')"))
+    from app.domain.derivations.cutover import deployed_head
+    await db_session.execute(text("INSERT INTO alembic_version VALUES (:head)"), {'head': deployed_head()})
     await db_session.commit()
 
 
@@ -652,3 +653,112 @@ async def test_class_d_real_derived_privacy_and_plaintext_rejection(
             {'marker': REDACTION_MARKER, 'id': fid})
         await db_session.commit()
         assert (await report(db_session, 'check'))['ok']
+
+
+# --- Exact DB/code schema head (cutover schema-head micro-slice) -------------------------------
+
+def _script_head_and_down():
+    from pathlib import Path
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+    from app.domain.derivations import cutover
+    backend = Path(cutover.__file__).resolve().parents[3]
+    config = Config(str(backend / 'alembic.ini'))
+    config.set_main_option('script_location', str(backend / 'migrations'))
+    script = ScriptDirectory.from_config(config)
+    head = script.get_current_head()
+    return head, script.get_revision(head).down_revision
+
+
+async def _set_versions(session, versions):
+    await session.rollback()
+    await session.execute(text('DELETE FROM alembic_version'))
+    for version in versions:
+        await session.execute(text('INSERT INTO alembic_version VALUES (:v)'), {'v': version})
+    await session.commit()
+
+
+async def test_schema_head_s1_current_equals_code_head_passes(db_session, schema):
+    from app.domain.derivations.cutover import deployed_head
+    await archive(db_session)
+    result = await report(db_session, 'check')
+    head = deployed_head()
+    assert result['schema'] == {'deployed_head': head, 'current': [head]}
+    assert 'schema_mismatch' not in result['blockers']
+
+
+async def test_schema_head_s2_stale_down_revision_fails_closed(db_session, schema):
+    from app.domain.derivations.cutover import CutoverError, prepare
+    head, down = _script_head_and_down()
+    assert down is not None and down != head
+    await archive(db_session)
+    plan = await report(db_session)
+    await _set_versions(db_session, [down])
+    with pytest.raises(CutoverError, match='schema_mismatch'):
+        await report(db_session, 'check')
+    with pytest.raises(CutoverError, match='replan_required'):
+        await prepare(db_session, plan)
+    assert await db_session.scalar(text('SELECT count(*) FROM derivation_fts_projections')) == 0
+
+
+@pytest.mark.parametrize('version', ['9999', 'ffffffffffff'])
+async def test_schema_head_s3_future_or_unknown_revision_fails_closed(db_session, schema, version):
+    from app.domain.derivations.cutover import CutoverError
+    await _set_versions(db_session, [version])
+    with pytest.raises(CutoverError, match='schema_mismatch'):
+        await report(db_session, 'check')
+
+
+@pytest.mark.parametrize('state', ['empty', 'two_rows', 'dropped'])
+async def test_schema_head_s4_missing_or_ambiguous_version_fails_closed(db_session, schema, state):
+    from app.domain.derivations.cutover import CutoverError, deployed_head
+    if state == 'empty':
+        await _set_versions(db_session, [])
+    elif state == 'two_rows':
+        await _set_versions(db_session, [deployed_head(), '0000'])
+    else:
+        await db_session.execute(text('DROP TABLE alembic_version'))
+        await db_session.commit()
+    with pytest.raises(CutoverError, match='schema_mismatch'):
+        await report(db_session, 'check')
+
+
+async def test_schema_head_s5_no_literal_pin_any_exact_head_passes(db_session, schema, monkeypatch):
+    from app.domain.derivations import cutover
+    monkeypatch.setattr(cutover, 'deployed_head', lambda: '0014')
+    await _set_versions(db_session, ['0014'])
+    result = await report(db_session, 'check')
+    assert result['schema'] == {'deployed_head': '0014', 'current': ['0014']}
+    await _set_versions(db_session, ['0013'])
+    with pytest.raises(cutover.CutoverError, match='schema_mismatch'):
+        await report(db_session, 'check')
+
+
+async def test_schema_head_s6_software_hash_still_binds_plans(db_session, schema, monkeypatch):
+    from app.domain.derivations import cutover
+    await archive(db_session)
+    plan = await report(db_session)
+    cutover.validate_plan(plan)
+    monkeypatch.setattr(cutover, 'software', lambda: '0' * 64)
+    with pytest.raises(cutover.CutoverError, match='invalid_plan'):
+        cutover.validate_plan(plan)
+
+
+async def test_schema_head_s7_no_quoted_revision_literal_in_cutover():
+    import re
+    from pathlib import Path
+    from app.domain.derivations import cutover
+    source = Path(cutover.__file__).read_text(encoding='utf-8')
+    assert re.findall(r"""['"][0-9]{4}['"]""", source) == []
+
+
+async def test_schema_head_s8_unresolvable_code_head_fails_closed(db_session, schema, monkeypatch):
+    from alembic.util.exc import CommandError
+    from app.domain.derivations import cutover
+    await archive(db_session)
+    def multiple_heads():
+        raise CommandError('synthetic multiple heads')
+    monkeypatch.setattr(cutover, 'deployed_head', multiple_heads)
+    with pytest.raises(CommandError):
+        await report(db_session, 'check')
+    assert await db_session.scalar(text('SELECT count(*) FROM derivation_fts_projections')) == 0
