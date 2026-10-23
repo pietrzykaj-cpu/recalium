@@ -20,7 +20,7 @@ from starlette.responses import JSONResponse as _JSONResponse
 from starlette.responses import FileResponse as _FileResponse
 from starlette.exceptions import HTTPException as _StarletteHTTPException
 
-from app.api.bridge import bridge_app, bridge_mcp
+from app.api.bridge import bridge_app, bridge_mcp, bridge_mcp_read
 from app.domain.derivations import visibility  # noqa: F401 — register dormant reader guard
 from app.api.routes import router as api_router
 from app.api.routes.search import router as search_router
@@ -197,7 +197,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     logger.info("DB pool initialized. Application ready.")
     logger.info("MCP retrieve_memory tool registered (SSE transport on /mcp/sse)")
-    async with bridge_mcp.session_manager.run():
+    async with bridge_mcp.session_manager.run(), bridge_mcp_read.session_manager.run():
         yield
 
     # Shutdown pipeline worker cleanly
